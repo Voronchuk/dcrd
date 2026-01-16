@@ -8,19 +8,25 @@ package mining
 import (
 	"container/heap"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/crypto/rand"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/gcs/v4/blockcf2"
+	"github.com/decred/dcrd/internal/blockalloc"
 	"github.com/decred/dcrd/internal/blockchain"
+	"github.com/decred/dcrd/internal/blockchain/indexers"
+	"github.com/decred/dcrd/internal/fees"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
 	"github.com/decred/dcrd/txscript/v4/stdscript"
@@ -202,6 +208,19 @@ type Config struct {
 	ValidateTransactionScripts func(tx *dcrutil.Tx,
 		utxoView *blockchain.UtxoViewpoint, flags txscript.ScriptFlags,
 		isAutoRevocationsEnabled bool) error
+
+	// FeeCalculator provides coin-type-specific fee estimation and validation.
+	// This is used for intelligent transaction prioritization and fee optimization.
+	FeeCalculator *fees.CoinTypeFeeCalculator
+
+	// BlockSpaceAllocator manages proportional block space allocation between
+	// coin types and provides transaction size tracking capabilities.
+	BlockSpaceAllocator *BlockSpaceAllocator
+
+	// SSFeeIndex provides efficient O(1) UTXO lookup by (coinType, address) for
+	// SSFee consolidation. When provided, enables UTXO augmentation to reduce
+	// dust UTXO accumulation. If nil, SSFee transactions create new UTXOs.
+	SSFeeIndex *indexers.SSFeeIndex
 }
 
 // TxDesc is a descriptor about a transaction in a transaction source along with
@@ -513,10 +532,12 @@ func standardTreasurybaseOpReturn(height uint32) ([]byte, error) {
 // regular and stake transaction trees in accordance with DCP0005.
 func calcBlockMerkleRoot(regularTxns, stakeTxns []*wire.MsgTx, hdrCmtActive bool) chainhash.Hash {
 	if !hdrCmtActive {
-		return standalone.CalcTxTreeMerkleRoot(regularTxns)
+		merkleRoot := standalone.CalcTxTreeMerkleRoot(regularTxns)
+		return merkleRoot
 	}
 
-	return standalone.CalcCombinedTxTreeMerkleRoot(regularTxns, stakeTxns)
+	merkleRoot := standalone.CalcCombinedTxTreeMerkleRoot(regularTxns, stakeTxns)
+	return merkleRoot
 }
 
 // calcBlockCommitmentRootV1 calculates and returns the required v1 block and
@@ -562,6 +583,7 @@ func createCoinbaseTx(subsidyCache *standalone.SubsidyCache,
 		for _, payout := range params.BlockOneLedger {
 			tx.AddTxOut(&wire.TxOut{
 				Value:    payout.Amount,
+				CoinType: cointype.CoinTypeVAR,
 				Version:  payout.ScriptVersion,
 				PkScript: payout.Script,
 			})
@@ -630,17 +652,22 @@ func createCoinbaseTx(subsidyCache *standalone.SubsidyCache,
 	tx.AddTxIn(coinbaseInput)
 	tx.TxIn[0].ValueIn = workSubsidy + treasurySubsidy
 	if treasuryOutput != nil {
+		// Add CoinType to treasury output
+		treasuryOutput.CoinType = cointype.CoinTypeVAR
 		tx.AddTxOut(treasuryOutput)
 	}
 	tx.AddTxOut(&wire.TxOut{
 		Value:    0,
+		CoinType: cointype.CoinTypeVAR,
 		PkScript: opReturnPkScript,
 	})
 	tx.AddTxOut(&wire.TxOut{
 		Value:    workSubsidy,
+		CoinType: cointype.CoinTypeVAR,
 		Version:  workSubsidyScriptVer,
 		PkScript: workSubsidyScript,
 	})
+
 	return dcrutil.NewTx(tx)
 }
 
@@ -685,15 +712,445 @@ func createTreasuryBaseTx(subsidyCache *standalone.SubsidyCache, nextBlockHeight
 	tx.TxIn[0].ValueIn = trsySubsidy
 	tx.AddTxOut(&wire.TxOut{
 		Value:    trsySubsidy,
+		CoinType: cointype.CoinTypeVAR,
 		Version:  0,
 		PkScript: []byte{txscript.OP_TADD},
 	})
 	tx.AddTxOut(&wire.TxOut{
 		Value:    0,
+		CoinType: cointype.CoinTypeVAR,
 		PkScript: opReturnTreasury,
 	})
 	retTx := dcrutil.NewTx(tx)
 	retTx.SetTree(wire.TxTreeStake)
+	return retTx, nil
+}
+
+// createSSFeeTxBatched creates batched staker fee distribution transactions for all coin types,
+// grouping voters by consolidation address to reduce UTXO fragmentation.
+//
+// This function extracts consolidation addresses from votes and groups voters with the same
+// consolidation address together. It then creates one SSFee transaction per group instead of
+// one per voter, significantly reducing dust UTXO accumulation.
+//
+// The function creates transactions with:
+// - Version 3+ (required for coin type support)
+// - Single input: either null input (creating new UTXO) or real UTXO input (augmenting existing)
+// - Single OP_RETURN output with SSFee marker (height + voter sequence)
+// - Single payment output to the consolidation address (with fee proportional to total stake)
+// - The payment output has the specified coin type (VAR, SKA-1, SKA-2, etc.)
+//
+// UTXO Augmentation:
+// If ssfeeIndex is provided, the function will look up existing UTXOs matching the consolidation
+// address and coin type. If found, it augments the UTXO by using it as input and creating an output
+// with value = utxo_value + total_fee. This prevents dust accumulation by consolidating fees into
+// existing UTXOs. If no matching UTXO exists, falls back to null input (creates new UTXO).
+//
+// Parameters:
+//   - coinType: The coin type for the fees (VAR=0, SKA-1=1, SKA-2=2, etc.)
+//   - totalFee: Total fee to distribute across all voters
+//   - voters: Vote transactions to extract consolidation addresses from
+//   - nextBlockHeight: Height of the block being created
+//   - ssfeeIndex: SSFee index for efficient UTXO lookup (nil disables augmentation)
+//
+// Returns:
+//   - Array of batched SSFee transactions (one per unique consolidation address)
+//   - Error if extraction or transaction creation fails
+func createSSFeeTxBatched(coinType cointype.CoinType, totalFee int64,
+	voters []*dcrutil.Tx, nextBlockHeight int64,
+	ssfeeIndex *indexers.SSFeeIndex,
+	blockUtxos *blockchain.UtxoViewpoint,
+	fetchUtxoEntry func(wire.OutPoint) (*blockchain.UtxoEntry, error),
+	generator *BlkTmplGenerator) ([]*dcrutil.Tx, error) {
+
+	if len(voters) == 0 {
+		return nil, nil
+	}
+
+	// consolidationGroup represents a group of voters with the same consolidation address
+	type consolidationGroup struct {
+		voterIndices []int  // Indices into voters array
+		hash160      []byte // Consolidation address hash160
+	}
+
+	// Step 1: Extract consolidation addresses from votes and group voters
+	groups := make(map[string]*consolidationGroup) // key: hex(hash160)
+
+	for i, voter := range voters {
+		voteTx := voter.MsgTx()
+
+		// Extract consolidation address from vote
+		hash160, err := stake.ExtractSSFeeConsolidationAddr(voteTx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract consolidation address from vote %s: %w",
+				voter.Hash(), err)
+		}
+
+		// Group by consolidation address
+		key := hex.EncodeToString(hash160)
+		if group, exists := groups[key]; exists {
+			group.voterIndices = append(group.voterIndices, i)
+		} else {
+			groups[key] = &consolidationGroup{
+				voterIndices: []int{i},
+				hash160:      hash160,
+			}
+		}
+	}
+
+	// Step 2: Create one batched SSFee transaction per group
+	// Use equal-per-vote distribution (not stake-weighted)
+	ssFeeTxns := make([]*dcrutil.Tx, 0, len(groups))
+
+	// Calculate equal fee per voter
+	numVotes := int64(len(voters))
+	feePerVoter := totalFee / numVotes
+	remainder := totalFee - (feePerVoter * numVotes)
+
+	// Sort group keys for deterministic remainder assignment
+	sortedKeys := make([]string, 0, len(groups))
+	for key := range groups {
+		sortedKeys = append(sortedKeys, key)
+	}
+	sort.Strings(sortedKeys)
+
+	for i, key := range sortedKeys {
+		group := groups[key]
+		// Calculate this group's fee (equal per voter in group)
+		groupFee := feePerVoter * int64(len(group.voterIndices))
+		// First sorted group gets remainder for deterministic results
+		if i == 0 && remainder > 0 {
+			groupFee += remainder
+		}
+
+		if groupFee <= 0 {
+			// Skip groups with zero fee (can happen due to rounding)
+			continue
+		}
+
+		// Convert hash160 to P2PKH pkScript for recipient output
+		recipientPkScript, err := stake.ConsolidationAddrToPkScript(group.hash160)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert hash160 to pkScript: %w", err)
+		}
+
+		// Step 3: Look up existing UTXO for augmentation (if index provided)
+		var existingOutpoint *wire.OutPoint
+		var existingValue int64
+		var existingBlockHeight int64
+		var existingBlockIndex uint32
+
+		if ssfeeIndex != nil {
+			outpoint, value, blockHeight, blockIndex, err := ssfeeIndex.LookupUTXO(coinType, group.hash160)
+			if err != nil {
+				// Log but don't fail - fall back to null input
+				log.Debugf("Failed to query SSFeeIndex for UTXO lookup: %v", err)
+			} else if outpoint != nil && value > 0 {
+				// Check if UTXO is already in-flight (used in a pending template)
+				if generator != nil && generator.isSSFeeUTXOInFlight(*outpoint, nextBlockHeight) {
+					log.Debugf("SSFee UTXO %v is in-flight for height %d - skipping", outpoint, nextBlockHeight)
+					outpoint = nil
+					value = 0
+				}
+			}
+
+			if outpoint != nil && value > 0 {
+				// CRITICAL: Verify UTXO is still available (not spent in mempool/current block)
+				var entry *blockchain.UtxoEntry
+				var isSpent bool
+
+				// First check blockUtxos (for UTXOs already used in current template)
+				if blockUtxos != nil {
+					entry = blockUtxos.LookupEntry(*outpoint)
+				}
+
+				if entry != nil {
+					// Entry found in block template view - check if spent
+					isSpent = entry.IsSpent()
+				} else if fetchUtxoEntry != nil {
+					// Entry not in block template - fetch from chain UTXO set
+					chainEntry, err := fetchUtxoEntry(*outpoint)
+					if err != nil {
+						log.Debugf("Failed to fetch UTXO %v from chain: %v", outpoint, err)
+						isSpent = true // Treat error as spent
+					} else if chainEntry == nil || chainEntry.IsSpent() {
+						isSpent = true
+					} else {
+						entry = chainEntry
+						isSpent = false
+					}
+				} else {
+					// No way to verify - assume available (legacy behavior)
+					isSpent = false
+				}
+
+				if isSpent {
+					log.Debugf("SSFee UTXO %v is spent - creating new UTXO instead", outpoint)
+				} else {
+					// UTXO is available - use for augmentation
+					existingOutpoint = outpoint
+					existingValue = value
+					existingBlockHeight = blockHeight
+					existingBlockIndex = blockIndex
+					log.Debugf("Found augmentable UTXO %v (value=%d, height=%d, index=%d) for consolidation address %x",
+						outpoint, value, blockHeight, blockIndex, group.hash160)
+				}
+			} else if outpoint == nil {
+				log.Debugf("No existing UTXO found in SSFeeIndex for consolidation address %x (will create new UTXO)",
+					group.hash160)
+			}
+		}
+
+		// Step 4: Create the batched SSFee transaction
+		tx := wire.NewMsgTx()
+		tx.Version = wire.TxVersionTreasury // Version 3+ required for coin type
+
+		// Add input: either null input or existing UTXO
+		if existingOutpoint != nil && existingValue > 0 {
+			// Augment existing UTXO
+			tx.AddTxIn(&wire.TxIn{
+				PreviousOutPoint: *existingOutpoint,
+				Sequence:         wire.MaxTxInSequenceNum,
+				BlockHeight:      uint32(existingBlockHeight),
+				BlockIndex:       existingBlockIndex,
+				ValueIn:          existingValue,
+			})
+		} else {
+			// Create null input (new UTXO)
+			tx.AddTxIn(&wire.TxIn{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  chainhash.Hash{},
+					Index: wire.MaxPrevOutIndex,
+				},
+				Sequence:    wire.MaxTxInSequenceNum,
+				BlockHeight: wire.NullBlockHeight,
+				BlockIndex:  wire.NullBlockIndex,
+				ValueIn:     0,
+			})
+		}
+
+		// Add OP_RETURN output with consolidation address (output[0] - standard SSFee format)
+		// Use first voter in group to determine the sequence
+		voterSeq := uint16(group.voterIndices[0])
+		ssfeeMarker := stake.CreateStakerSSFeeMarker(nextBlockHeight, voterSeq)
+		tx.AddTxOut(&wire.TxOut{
+			Value:    0,
+			Version:  0,
+			CoinType: coinType,
+			PkScript: ssfeeMarker,
+		})
+
+		// Add payment output to consolidation address (output[1] - standard SSFee format)
+		outputValue := groupFee
+		if existingValue > 0 {
+			// Augmenting: new value = existing value + fee
+			outputValue = existingValue + groupFee
+		}
+
+		tx.AddTxOut(&wire.TxOut{
+			Value:    outputValue,
+			Version:  0,
+			PkScript: recipientPkScript,
+			CoinType: coinType,
+		})
+
+		retTx := dcrutil.NewTx(tx)
+		retTx.SetTree(wire.TxTreeStake)
+
+		// Mark the UTXO as in-flight if we used one for augmentation
+		if existingOutpoint != nil && generator != nil {
+			generator.markSSFeeUTXOInFlight(*existingOutpoint, nextBlockHeight)
+		}
+
+		ssFeeTxns = append(ssFeeTxns, retTx)
+	}
+
+	return ssFeeTxns, nil
+}
+
+// createMinerSSFeeTx creates a miner fee distribution transaction for non-VAR coins.
+// These transactions distribute fees collected from non-VAR transactions to the miner.
+//
+// The transaction has:
+// - Version 3+ (same as SSFee for stakers)
+// - Single input: either null input (creating new UTXO) or real UTXO input (augmenting existing)
+// - Single output to the miner address (with fee added to existing value if augmenting)
+// - The output has the specified non-VAR coin type
+//
+// UTXO Augmentation:
+// If utxoView is provided and contains a UTXO matching the miner address and coin type,
+// this function will use that UTXO as input and create an output with value = utxo_value + fee.
+// This prevents dust accumulation by consolidating fees into existing UTXOs.
+// If no matching UTXO exists, falls back to null input (creates new UTXO).
+func createMinerSSFeeTx(coinType cointype.CoinType, totalFee int64,
+	minerAddress stdaddr.Address, nextBlockHeight int64,
+	ssfeeIndex *indexers.SSFeeIndex,
+	blockUtxos *blockchain.UtxoViewpoint,
+	fetchUtxoEntry func(wire.OutPoint) (*blockchain.UtxoEntry, error),
+	generator *BlkTmplGenerator) (*dcrutil.Tx, error) {
+
+	// SSFee cannot be used for VAR fees (those go through coinbase)
+	if coinType == cointype.CoinTypeVAR {
+		return nil, fmt.Errorf("miner SSFee cannot distribute VAR fees")
+	}
+
+	// Validate fee amount
+	if totalFee <= 0 {
+		return nil, fmt.Errorf("invalid fee amount: %d", totalFee)
+	}
+
+	// Create OP_RETURN output for unique hash
+	opReturnScript := stake.CreateMinerSSFeeMarker(nextBlockHeight)
+
+	// Create payment script for the miner address or anyone-can-spend if nil
+	// Use OP_SSGEN-tagged scripts like staker SSFee outputs for consistency
+	var scriptVersion uint16
+	var payScript []byte
+	if minerAddress != nil {
+		var rawScript []byte
+		scriptVersion, rawScript = minerAddress.PaymentScript()
+		// Convert to OP_SSGEN-tagged script (stake-tagged)
+		// This ensures the output is properly recognized as a stake tree output
+		payScript = make([]byte, 0, len(rawScript)+1)
+		payScript = append(payScript, txscript.OP_SSGEN)
+		payScript = append(payScript, rawScript...)
+	} else {
+		// Fallback to anyone-can-spend with OP_SSGEN tag
+		scriptVersion = 0
+		payScript = []byte{txscript.OP_SSGEN, txscript.OP_TRUE}
+	}
+
+	// Extract hash160 from payScript for SSFeeIndex lookup
+	// This is needed to find existing miner SSFee UTXOs for consolidation
+	var minerHash160 []byte
+	if minerAddress != nil && len(payScript) == 26 {
+		// OP_SSGEN-tagged P2PKH script format (26 bytes):
+		// OP_SSGEN OP_DUP OP_HASH160 OP_DATA_20 <20 bytes hash160> OP_EQUALVERIFY OP_CHECKSIG
+		minerHash160 = payScript[4:24]
+	}
+
+	// Try to find existing UTXO to augment using SSFeeIndex (prevent dust accumulation)
+	var inputOutpoint *wire.OutPoint
+	var augmentValue int64
+	var existingBlockHeight int64
+	var existingBlockIndex uint32
+
+	if ssfeeIndex != nil && minerHash160 != nil {
+		outpoint, value, blockHeight, blockIndex, err := ssfeeIndex.LookupUTXO(coinType, minerHash160)
+		if err != nil {
+			// Log but don't fail - fall back to null input
+			log.Debugf("Failed to query SSFeeIndex for miner UTXO lookup: %v", err)
+		} else if outpoint != nil && value > 0 {
+			// Check if UTXO is already in-flight (used in a pending template)
+			if generator != nil && generator.isSSFeeUTXOInFlight(*outpoint, nextBlockHeight) {
+				log.Debugf("Miner SSFee UTXO %v is in-flight for height %d - skipping", outpoint, nextBlockHeight)
+				outpoint = nil
+				value = 0
+			}
+		}
+
+		if outpoint != nil && value > 0 {
+			// CRITICAL: Verify UTXO is still available (not spent in mempool/current block)
+			var entry *blockchain.UtxoEntry
+			var isSpent bool
+
+			// First check blockUtxos (for UTXOs already used in current template)
+			if blockUtxos != nil {
+				entry = blockUtxos.LookupEntry(*outpoint)
+			}
+
+			if entry != nil {
+				// Entry found in block template view - check if spent
+				isSpent = entry.IsSpent()
+			} else if fetchUtxoEntry != nil {
+				// Entry not in block template - fetch from chain UTXO set
+				chainEntry, err := fetchUtxoEntry(*outpoint)
+				if err != nil {
+					log.Debugf("Failed to fetch miner UTXO %v from chain: %v", outpoint, err)
+					isSpent = true
+				} else if chainEntry == nil || chainEntry.IsSpent() {
+					isSpent = true
+				} else {
+					entry = chainEntry
+					isSpent = false
+				}
+			} else {
+				// No way to verify - assume available (legacy behavior)
+				isSpent = false
+			}
+
+			if isSpent {
+				log.Debugf("Miner SSFee UTXO %v is spent - creating new UTXO instead", outpoint)
+			} else {
+				// UTXO is available - safe to use for augmentation
+				inputOutpoint = outpoint
+				augmentValue = value
+				existingBlockHeight = blockHeight
+				existingBlockIndex = blockIndex
+				log.Debugf("Found augmentable miner SSFee UTXO %v (value=%d, height=%d, index=%d) for coin type %d",
+					outpoint, value, blockHeight, blockIndex, coinType)
+			}
+		} else if outpoint == nil {
+			log.Debugf("No existing miner SSFee UTXO found in SSFeeIndex for hash160 %x (will create new UTXO)",
+				minerHash160)
+		}
+	}
+
+	// Create the miner SSFee transaction
+	tx := wire.NewMsgTx()
+	tx.Version = 3 // Same version as staker SSFee
+
+	// Add input: either real UTXO (augmentation) or null input (creation)
+	// SignatureScript must be explicitly empty (not nil) for validation
+	if inputOutpoint != nil {
+		// UTXO augmentation: use real input with fraud proof data
+		tx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: *inputOutpoint,
+			Sequence:         wire.MaxTxInSequenceNum,
+			BlockHeight:      uint32(existingBlockHeight),
+			BlockIndex:       existingBlockIndex,
+			ValueIn:          augmentValue,
+			SignatureScript:  []byte{}, // Anyone-can-spend (OP_SSGEN output)
+		})
+	} else {
+		// Fallback: create new UTXO with null input (like coinbase/treasurybase)
+		tx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: *wire.NewOutPoint(&chainhash.Hash{},
+				wire.MaxPrevOutIndex, wire.TxTreeRegular),
+			Sequence:        wire.MaxTxInSequenceNum,
+			BlockHeight:     wire.NullBlockHeight,
+			BlockIndex:      wire.NullBlockIndex,
+			ValueIn:         totalFee,
+			SignatureScript: []byte{},
+		})
+	}
+
+	// Calculate output value: fee + existing UTXO value (if augmenting)
+	outputValue := totalFee + augmentValue
+
+	// Add OP_RETURN output for unique hash (output[0] - consistent with voter SSFee)
+	tx.AddTxOut(&wire.TxOut{
+		Value:    0,
+		CoinType: coinType,
+		PkScript: opReturnScript,
+	})
+
+	// Create payment output to miner (output[1] - consistent with voter SSFee)
+	tx.AddTxOut(&wire.TxOut{
+		Value:    outputValue,
+		CoinType: coinType,
+		Version:  scriptVersion,
+		PkScript: payScript,
+	})
+
+	retTx := dcrutil.NewTx(tx)
+	retTx.SetTree(wire.TxTreeStake)
+
+	// Mark the UTXO as in-flight if we used one for augmentation
+	if inputOutpoint != nil && generator != nil {
+		generator.markSSFeeUTXOInFlight(*inputOutpoint, nextBlockHeight)
+	}
+
 	return retTx, nil
 }
 
@@ -892,8 +1349,9 @@ func (g *BlkTmplGenerator) handleTooFewVoters(nextHeight int64,
 			return nil, err
 		}
 		header := &block.Header
-		header.MerkleRoot = calcBlockMerkleRoot(block.Transactions,
+		calculatedMerkleRoot := calcBlockMerkleRoot(block.Transactions,
 			block.STransactions, hdrCmtActive)
+		header.MerkleRoot = calculatedMerkleRoot
 
 		// Calculate the required difficulty for the block.
 		reqDifficulty, err := g.cfg.CalcNextRequiredDifficulty(prevHash, ts)
@@ -1081,12 +1539,49 @@ func (g *BlkTmplGenerator) addAutoRevocationsToQueue(winningTickets map[chainhas
 // template is generated.
 type BlkTmplGenerator struct {
 	cfg *Config
+
+	// inFlightSSFeeUTXOs tracks UTXOs currently used in pending block templates.
+	// These are cleared when a new block is connected (template mined or abandoned).
+	// Key: OutPoint being spent, Value: block height the template was created for
+	inFlightSSFeeUTXOs map[wire.OutPoint]int64
+	inFlightMtx        sync.Mutex
 }
 
 // NewBlkTmplGenerator returns a new block template generator for the given
 // policy using transactions from the provided transaction source.
 func NewBlkTmplGenerator(cfg *Config) *BlkTmplGenerator {
-	return &BlkTmplGenerator{cfg: cfg}
+	return &BlkTmplGenerator{
+		cfg:                cfg,
+		inFlightSSFeeUTXOs: make(map[wire.OutPoint]int64),
+	}
+}
+
+// ClearInFlightSSFeeUTXOs clears all in-flight SSFee UTXOs for heights <= the
+// given block height. Called when a block is connected to clear obsolete entries.
+func (g *BlkTmplGenerator) ClearInFlightSSFeeUTXOs(blockHeight int64) {
+	g.inFlightMtx.Lock()
+	for outpoint, height := range g.inFlightSSFeeUTXOs {
+		if height <= blockHeight {
+			delete(g.inFlightSSFeeUTXOs, outpoint)
+		}
+	}
+	g.inFlightMtx.Unlock()
+}
+
+// isSSFeeUTXOInFlight returns true if the UTXO is already being used in a pending
+// block template for the current or recent height.
+func (g *BlkTmplGenerator) isSSFeeUTXOInFlight(outpoint wire.OutPoint, currentHeight int64) bool {
+	g.inFlightMtx.Lock()
+	defer g.inFlightMtx.Unlock()
+	height, exists := g.inFlightSSFeeUTXOs[outpoint]
+	return exists && height >= currentHeight-1
+}
+
+// markSSFeeUTXOInFlight marks a UTXO as being used in a pending block template.
+func (g *BlkTmplGenerator) markSSFeeUTXOInFlight(outpoint wire.OutPoint, blockHeight int64) {
+	g.inFlightMtx.Lock()
+	g.inFlightSSFeeUTXOs[outpoint] = blockHeight
+	g.inFlightMtx.Unlock()
 }
 
 // calcFeePerKb returns an adjusted fee per kilobyte taking the provided
@@ -1098,6 +1593,42 @@ func calcFeePerKb(txDesc *TxDesc, ancestorStats *TxAncestorStats) float64 {
 	}
 	return (float64(txDesc.Fee+ancestorStats.Fees) * float64(kilobyte)) /
 		float64(int64(txSize)+ancestorStats.SizeBytes)
+}
+
+// calcCoinTypeAwareFeePerKb returns a coin-type-adjusted fee per kilobyte that
+// takes into account the economic dynamics and network conditions specific to
+// the transaction's coin type. This enables intelligent prioritization where
+// each coin type can have its own fee market.
+func calcCoinTypeAwareFeePerKb(txDesc *TxDesc, ancestorStats *TxAncestorStats,
+	coinType cointype.CoinType, feeCalc *fees.CoinTypeFeeCalculator) float64 {
+
+	// Get base fee rate using standard calculation
+	baseFeeRate := calcFeePerKb(txDesc, ancestorStats)
+
+	// Get coin-type-specific fee estimation for comparison and adjustment
+
+	// Get the estimated fee rate for this coin type with fast confirmation (1 block)
+	estimatedRate, err := feeCalc.EstimateFeeRate(coinType, 1)
+	if err != nil {
+		// Fallback to base calculation if estimation fails
+		return baseFeeRate
+	}
+
+	// Calculate the coin-type-specific minimum fee rate
+	estimatedFeePerKb := float64(estimatedRate)
+
+	// Use the higher of actual fee rate or coin-type minimum for prioritization
+	// This ensures that transactions paying coin-type-appropriate fees get priority
+	// while still allowing higher-fee transactions to jump ahead within their coin type
+	if baseFeeRate >= estimatedFeePerKb {
+		// Transaction is paying above coin-type minimum, use actual rate
+		return baseFeeRate
+	} else {
+		// Transaction is paying below coin-type expectations,
+		// but still give it proportional priority within its tier
+		adjustmentFactor := baseFeeRate / estimatedFeePerKb
+		return estimatedFeePerKb * adjustmentFactor
+	}
 }
 
 // NewBlockTemplate returns a new block template that is ready to be solved
@@ -1204,25 +1735,9 @@ func (g *BlkTmplGenerator) NewBlockTemplate(payToAddress stdaddr.Address) (*Bloc
 		return nil, err
 	}
 
-	isSubsidyEnabled, err := g.cfg.IsSubsidySplitAgendaActive(&prevHash)
-	if err != nil {
-		return nil, err
-	}
-
-	isSubsidyR2Enabled, err := g.cfg.IsSubsidySplitR2AgendaActive(&prevHash)
-	if err != nil {
-		return nil, err
-	}
-
 	// Determine which subsidy split variant to use depending on the active
 	// agendas.
-	subsidySplitVariant := standalone.SSVOriginal
-	switch {
-	case isSubsidyR2Enabled:
-		subsidySplitVariant = standalone.SSVDCP0012
-	case isSubsidyEnabled:
-		subsidySplitVariant = standalone.SSVDCP0010
-	}
+	subsidySplitVariant := standalone.SSVMonetarium
 
 	var (
 		isTVI            bool
@@ -1298,7 +1813,14 @@ func (g *BlkTmplGenerator) NewBlockTemplate(payToAddress stdaddr.Address) (*Bloc
 	// or not there is an area allocated for high-priority transactions.
 	miningView := g.cfg.TxSource.MiningView()
 	sourceTxns := miningView.TxDescs()
-	priorityQueue := newTxPriorityQueue(len(sourceTxns), txPQByStakeAndFee)
+	// Use coin-type-aware prioritization when fee calculator is available
+	var prioritizationFunc txPriorityQueueLessFunc
+	if g.cfg.FeeCalculator != nil {
+		prioritizationFunc = txPQByCoinTypeAndFee
+	} else {
+		prioritizationFunc = txPQByStakeAndFee
+	}
+	priorityQueue := newTxPriorityQueue(len(sourceTxns), prioritizationFunc)
 	prioritizedTxns := make(map[chainhash.Hash]struct{}, len(sourceTxns))
 
 	// Create a slice to hold the transactions to be included in the
@@ -1373,12 +1895,25 @@ mempoolLoop:
 		// Setup dependencies for any transactions which reference
 		// other transactions in the mempool so they can be properly
 		// ordered below.
-		prioItem := &txPrioItem{txDesc: txDesc, txType: txDesc.Type}
+
+		// Determine the primary coin type for this transaction
+		primaryCoinType := blockalloc.GetTransactionCoinType(tx)
+
+		// Check if this is an SKA emission transaction
+		isSKAEmission := wire.IsSKAEmissionTransaction(msgTx)
+
+		prioItem := &txPrioItem{
+			txDesc:        txDesc,
+			txType:        txDesc.Type,
+			coinType:      primaryCoinType,
+			isSKAEmission: isSKAEmission,
+		}
 		for i, txIn := range tx.MsgTx().TxIn {
 			// Evaluate if this is a stakebase input or not. If it is, continue
 			// without evaluation of the input.
 			// if isStakeBase
-			if (i == 0 && isSSGen) || isTSpend {
+			isSKAEmissionForUTXO := wire.IsSKAEmissionTransaction(tx.MsgTx())
+			if (i == 0 && isSSGen) || isTSpend || isSKAEmissionForUTXO {
 				continue
 			}
 
@@ -1401,13 +1936,20 @@ mempoolLoop:
 		prioItem.priority = CalcPriority(tx.MsgTx(), utxos,
 			nextBlockHeight)
 
-		// Calculate the fee in Atoms/KB.
+		// Calculate the fee in Atoms/KB using coin-type-specific calculation.
 		// NOTE: This is a more precise value than the one calculated
 		// during calcMinRelayFee which rounds up to the nearest full
 		// kilobyte boundary.  This is beneficial since it provides an
 		// incentive to create smaller transactions.
 		ancestorStats, hasStats := miningView.AncestorStats(tx.Hash())
-		prioItem.feePerKB = calcFeePerKb(txDesc, ancestorStats)
+
+		// Use coin-type-aware fee calculation when available
+		if g.cfg.FeeCalculator != nil {
+			prioItem.feePerKB = calcCoinTypeAwareFeePerKb(txDesc, ancestorStats, prioItem.coinType, g.cfg.FeeCalculator)
+		} else {
+			// Fallback to standard calculation
+			prioItem.feePerKB = calcFeePerKb(txDesc, ancestorStats)
+		}
 		prioItem.fee = txDesc.Fee + ancestorStats.Fees
 		prioItemMap[*tx.Hash()] = prioItem
 		hasParents := miningView.hasParents(tx.Hash())
@@ -1444,7 +1986,7 @@ mempoolLoop:
 	// pop loop. This is buggy, but not catastrophic behaviour. A future
 	// release should fix it. TODO
 	blockSigOps := int64(0)
-	totalFees := int64(0)
+	totalFees := wire.NewFeesByType()
 
 	numSStx := 0
 	numSSGen := 0
@@ -1482,9 +2024,78 @@ mempoolLoop:
 		return nil, makeError(ErrSerializeHeader, str)
 	}
 
+	// Initialize block space allocator for coin type-based space management
+	var blockSpaceAllocator *BlockSpaceAllocator
+	if g.cfg.BlockSpaceAllocator != nil {
+		// Use configured allocator with fee calculator integration
+		blockSpaceAllocator = g.cfg.BlockSpaceAllocator
+	} else {
+		// Create basic allocator for backward compatibility
+		blockSpaceAllocator = NewBlockSpaceAllocator(g.cfg.Policy.BlockMaxSize, g.cfg.ChainParams)
+	}
+
+	// Calculate total pending transaction bytes from mempool for each coin type.
+	// This provides visibility into the allocation decisions and helps with debugging.
+	mempoolPendingBytes := make(map[cointype.CoinType]uint32)
+	for _, txDesc := range sourceTxns {
+		coinType := blockalloc.GetTransactionCoinType(txDesc.Tx)
+		txSize := uint32(txDesc.Tx.MsgTx().SerializeSize())
+		mempoolPendingBytes[coinType] += txSize
+	}
+
+	// Log initial allocation based on actual mempool demand.
+	// This helps diagnose issues where SKA reserves space but has no transactions.
+	if len(mempoolPendingBytes) > 0 {
+		initialAlloc := blockSpaceAllocator.AllocateBlockSpace(mempoolPendingBytes)
+		varAlloc := initialAlloc.GetAllocationForCoinType(cointype.CoinTypeVAR)
+		varPending := mempoolPendingBytes[cointype.CoinTypeVAR]
+
+		var varAllocSize uint32
+		if varAlloc != nil {
+			varAllocSize = varAlloc.FinalAllocation
+		}
+
+		log.Debugf("Block template mempool analysis: VAR pending=%d bytes, "+
+			"VAR allocation=%d bytes, block max=%d bytes",
+			varPending, varAllocSize, g.cfg.Policy.BlockMaxSize)
+
+		// Log VAR allocation efficiency
+		if varAllocSize > 0 && varPending > 0 {
+			efficiency := float64(varPending) / float64(varAllocSize) * 100
+			log.Debugf("VAR allocation efficiency: %.1f%% (%d used of %d allocated)",
+				efficiency, varPending, varAllocSize)
+		} else if varAllocSize > 0 && varPending == 0 {
+			log.Debugf("VAR allocation: %d bytes allocated, but 0 bytes pending (allocation unused)",
+				varAllocSize)
+		}
+
+		// Log SKA pending if any
+		for coinType, pending := range mempoolPendingBytes {
+			if coinType.IsSKA() && pending > 0 {
+				skaAlloc := initialAlloc.GetAllocationForCoinType(coinType)
+				var skaAllocSize uint32
+				if skaAlloc != nil {
+					skaAllocSize = skaAlloc.FinalAllocation
+				}
+				log.Debugf("Block template mempool analysis: %s pending=%d bytes, "+
+					"%s allocation=%d bytes", coinType, pending, coinType, skaAllocSize)
+
+				// Log SKA allocation efficiency
+				if skaAllocSize > 0 {
+					skaEfficiency := float64(pending) / float64(skaAllocSize) * 100
+					log.Debugf("%s allocation efficiency: %.1f%% (%d used of %d allocated)",
+						coinType, skaEfficiency, pending, skaAllocSize)
+				}
+			}
+		}
+	}
+
+	transactionTracker := blockalloc.NewTransactionSizeTracker(blockSpaceAllocator.BlockSpaceAllocator)
+
 	// Choose which transactions make it into the block.
 nextPriorityQueueItem:
 	for priorityQueue.Len() > 0 {
+		log.Debugf("Priority queue length: %d", priorityQueue.Len())
 		// Grab the highest priority (or highest fee per kilobyte
 		// depending on the sort order) transaction.
 		prioItem := heap.Pop(priorityQueue).(*txPrioItem)
@@ -1553,7 +2164,7 @@ nextPriorityQueueItem:
 		// Tspend window.
 		if isTSpend {
 			if !isTVI {
-				log.Tracef("Skipping tspend %v because block "+
+				log.Debugf("Skipping tspend %v because block "+
 					"is not on a TVI: %v", tx.Hash(),
 					nextBlockHeight)
 				continue
@@ -1566,7 +2177,7 @@ nextPriorityQueueItem:
 				exp, g.cfg.ChainParams.TreasuryVoteInterval,
 				g.cfg.ChainParams.TreasuryVoteIntervalMultiplier) {
 
-				log.Tracef("Skipping treasury spend %v at height %d because it "+
+				log.Debugf("Skipping treasury spend %v at height %d because it "+
 					"has an expiry of %d that is outside of the voting window",
 					tx.Hash(), nextBlockHeight, exp)
 				continue
@@ -1577,7 +2188,7 @@ nextPriorityQueueItem:
 			err = g.cfg.CheckTSpendHasVotes(prevHash,
 				dcrutil.NewTx(tx.MsgTx()))
 			if err != nil {
-				log.Tracef("Skipping tspend %v because it doesn't have enough "+
+				log.Debugf("Skipping tspend %v because it doesn't have enough "+
 					"votes: height %v reason '%v'", tx.Hash(), nextBlockHeight, err)
 				continue
 			}
@@ -1590,7 +2201,7 @@ nextPriorityQueueItem:
 			// TSpends either by approval % or by expiry.
 			tspendAmount := tx.MsgTx().TxIn[0].ValueIn
 			if maxTreasurySpend-tspendAmount < 0 {
-				log.Tracef("Skipping tspend %v because it spends "+
+				log.Debugf("Skipping tspend %v because it spends "+
 					"more than allowed: treasury %d tspend %d",
 					tx.Hash(), maxTreasurySpend, tspendAmount)
 				continue
@@ -1600,7 +2211,7 @@ nextPriorityQueueItem:
 
 		// Skip if we already have too many TAdds.
 		if isTAdd && numTAdds >= blockchain.MaxTAddsPerBlock {
-			log.Tracef("Skipping tadd %s because it would exceed "+
+			log.Debugf("Skipping tadd %s because it would exceed "+
 				"the max number of tadds allowed in a block",
 				tx.Hash())
 			logSkippedDeps(tx, deps)
@@ -1610,7 +2221,7 @@ nextPriorityQueueItem:
 		// Skip if we already have too many SStx.
 		if isSStx && (numSStx >=
 			int(g.cfg.ChainParams.MaxFreshStakePerBlock)) {
-			log.Tracef("Skipping sstx %s because it would exceed "+
+			log.Debugf("Skipping sstx %s because it would exceed "+
 				"the max number of sstx allowed in a block", tx.Hash())
 			logSkippedDeps(tx, deps)
 			continue
@@ -1619,6 +2230,7 @@ nextPriorityQueueItem:
 		// Skip if the SStx commit value is below the value required by the
 		// stake diff.
 		if isSStx && (tx.MsgTx().TxOut[0].Value < best.NextStakeDiff) {
+			log.Debugf("Skipping ticket %s: price %d < stake diff %d", tx.Hash(), tx.MsgTx().TxOut[0].Value, best.NextStakeDiff)
 			continue
 		}
 
@@ -1642,6 +2254,7 @@ nextPriorityQueueItem:
 				hashInSlice(*ticketHash, best.MissedTickets)
 
 			if !eligible {
+				log.Debugf("Skipping revocation %s: ticket %s not eligible", tx.Hash(), ticketHash)
 				continue
 			}
 		}
@@ -1649,19 +2262,27 @@ nextPriorityQueueItem:
 		if miningView.isRejected(tx.Hash()) {
 			// If the transaction or any of its ancestors have been rejected,
 			// discard the transaction.
+			log.Debugf("Skipping tx %s: rejected by ancestor check", tx.Hash())
 			continue
 		}
 
 		ancestors := miningView.ancestors(tx.Hash())
 		ancestorStats, _ := miningView.AncestorStats(tx.Hash())
 		oldFee := prioItem.feePerKB
-		prioItem.feePerKB = calcFeePerKb(prioItem.txDesc, ancestorStats)
+
+		// Recalculate fee using coin-type-aware method when available
+		if g.cfg.FeeCalculator != nil {
+			prioItem.feePerKB = calcCoinTypeAwareFeePerKb(prioItem.txDesc, ancestorStats, prioItem.coinType, g.cfg.FeeCalculator)
+		} else {
+			prioItem.feePerKB = calcFeePerKb(prioItem.txDesc, ancestorStats)
+		}
 
 		feeDecreased := oldFee > prioItem.feePerKB
 		if feeDecreased && ancestorStats.NumAncestors == 0 {
 			// If the fee decreased due to ancestors being included in the
 			// template and the transaction has no parents, then enqueue it one
 			// more time with an accurate feePerKb.
+			log.Debugf("Requeuing tx %s for fee recalc: %.2f -> %.2f (no ancestors)", tx.Hash(), oldFee, prioItem.feePerKB)
 			heap.Push(priorityQueue, prioItem)
 			prioritizedTxns[*tx.Hash()] = struct{}{}
 			continue
@@ -1674,17 +2295,37 @@ nextPriorityQueueItem:
 			// ancestors that have already been included in the block template.
 			// The transaction will be added back to the priority queue when all
 			// parent transactions are included in the template.
+			log.Debugf("Skipping tx %s: fee decreased %.2f -> %.2f (has %d ancestors)", tx.Hash(), oldFee, prioItem.feePerKB, ancestorStats.NumAncestors)
 			continue
 		}
 
-		// Enforce maximum block size.  Also check for overflow.
+		// Enforce coin type-based block space allocation.
 		txSize := uint32(tx.MsgTx().SerializeSize())
 		blockPlusTxSize := blockSize + txSize + uint32(ancestorStats.SizeBytes)
-		if blockPlusTxSize < blockSize ||
-			blockPlusTxSize >= g.cfg.Policy.BlockMaxSize {
-			log.Tracef("Skipping tx %s (size %v) because it "+
-				"would exceed the max block size; cur block "+
-				"size %v, cur num tx %v", tx.Hash(), txSize,
+
+		// Check for arithmetic overflow
+		if blockPlusTxSize < blockSize {
+			log.Debugf("Skipping tx %s due to size arithmetic overflow", tx.Hash())
+			logSkippedDeps(tx, deps)
+			miningView.reject(tx.Hash())
+			continue
+		}
+
+		// Check if transaction fits within coin type allocation
+		// SKA emission transactions bypass this check because:
+		// 1. They are the first transaction of their SKA type (always fit)
+		// 2. They must be included at emission height (critical system transaction)
+		// 3. Block space is guaranteed to be available for them
+		coinType := blockalloc.GetTransactionCoinType(tx)
+		isSKAEmission := wire.IsSKAEmissionTransaction(tx.MsgTx())
+
+		if isSKAEmission {
+			log.Infof("Including SKA emission tx %s (coin type %d, size %v) with guaranteed block space",
+				tx.Hash(), coinType, txSize)
+		} else if !transactionTracker.CanAddTransaction(tx) {
+			log.Debugf("Skipping tx %s (coin type %d, size %v) because it "+
+				"would exceed the coin type allocation; cur block "+
+				"size %v, cur num tx %v", tx.Hash(), coinType, txSize,
 				blockSize, len(blockTxns))
 			logSkippedDeps(tx, deps)
 			miningView.reject(tx.Hash())
@@ -1697,7 +2338,7 @@ nextPriorityQueueItem:
 		numSigOpsBundle := numSigOps + int64(ancestorStats.TotalSigOps)
 		if blockSigOps+numSigOpsBundle < blockSigOps ||
 			blockSigOps+numSigOpsBundle > blockchain.MaxSigOpsPerBlock {
-			log.Tracef("Skipping tx %s because it would "+
+			log.Debugf("Skipping tx %s because it would "+
 				"exceed the maximum sigops per block", tx.Hash())
 			logSkippedDeps(tx, deps)
 			miningView.reject(tx.Hash())
@@ -1708,6 +2349,7 @@ nextPriorityQueueItem:
 		// valid for the next block.
 		if isSSGen {
 			if foundWinningTickets[tx.MsgTx().TxIn[1].PreviousOutPoint.Hash] {
+				log.Debugf("Skipping vote %s: already processed", tx.Hash())
 				continue
 			}
 			msgTx := tx.MsgTx()
@@ -1719,17 +2361,47 @@ nextPriorityQueueItem:
 			}
 
 			if !isEligible {
+				log.Debugf("Skipping vote %s: not eligible for next block", tx.Hash())
 				continue
 			}
 		}
 
-		// Skip transactions that do not pay enough fee except for stake
-		// transactions.
-		if prioItem.feePerKB < float64(g.cfg.Policy.TxMinFreeFee) &&
-			tx.Tree() != wire.TxTreeStake {
+		// Reject transactions with insufficient fees, but use static minimum
+		// fee (not dynamic multiplier) to avoid rejecting valid mempool
+		// transactions when network conditions change. The priority queue
+		// already handles fee-based prioritization for block space allocation.
+		//
+		// This protects against:
+		// - 0-fee spam transactions
+		// - Transactions from non-validating peers
+		// - Direct RPC submissions bypassing mempool
+		//
+		// But allows valid mempool transactions (that passed dynamic fee
+		// validation at entry time) to eventually be mined.
+		skipForLowFee := false
+		// Note: isSKAEmission already declared above for blockspace check
+		if tx.Tree() != wire.TxTreeStake && !isSKAEmission {
+			// Use coin-type-specific minimum relay fee
+			var minStaticFee float64
+			if prioItem.coinType == cointype.CoinTypeVAR {
+				minStaticFee = float64(g.cfg.Policy.TxMinFreeFee)
+			} else {
+				// SKA and other coin types use chain-specific fee rate
+				minStaticFee = float64(g.cfg.ChainParams.SKAMinRelayTxFee)
+			}
+			// Apply 10% tolerance to account for integer division rounding in fee calculation.
+			// Wallet calculates: fee = (feePerKB * txSize) / 1000 (truncates)
+			// Miner recalculates: feePerKB = (fee * 1000) / txSize (can be slightly lower)
+			// Example: 50 atoms/KB, 211 bytes → 10 atoms fee → 47.39 atoms/KB recalculated
+			minStaticFeeWithTolerance := minStaticFee * 0.90
+			if prioItem.feePerKB < minStaticFeeWithTolerance {
+				log.Debugf("Skipping tx %s with feePerKB %.2f < minimum %.2f (tolerance: %.2f)",
+					tx.Hash(), prioItem.feePerKB, minStaticFee, minStaticFeeWithTolerance)
+				skipForLowFee = true
+			}
+		}
 
-			log.Tracef("Skipping tx %s with feePerKB %.2f < TxMinFreeFee %d ",
-				tx.Hash(), prioItem.feePerKB, g.cfg.Policy.TxMinFreeFee)
+		if skipForLowFee {
 			logSkippedDeps(tx, deps)
 			miningView.reject(tx.Hash())
 			continue
@@ -1745,20 +2417,33 @@ nextPriorityQueueItem:
 				blockUtxos, false, &bestHeader, isTreasuryEnabled,
 				isAutoRevocationsEnabled, subsidySplitVariant)
 			if err != nil {
-				log.Tracef("Skipping tx %s due to error in "+
+				log.Debugf("Skipping tx %s due to error in "+
 					"CheckTransactionInputs: %v", bundledTx.Tx.Hash(), err)
 				logSkippedDeps(bundledTx.Tx, deps)
 				miningView.reject(bundledTx.Tx.Hash())
 				continue nextPriorityQueueItem
 			}
-			err = g.cfg.ValidateTransactionScripts(bundledTx.Tx, blockUtxos,
-				scriptFlags, isAutoRevocationsEnabled)
-			if err != nil {
-				log.Tracef("Skipping tx %s due to error in "+
-					"ValidateTransactionScripts: %v", bundledTx.Tx.Hash(), err)
-				logSkippedDeps(bundledTx.Tx, deps)
-				miningView.reject(bundledTx.Tx.Hash())
-				continue nextPriorityQueueItem
+			// Skip standard script validation for SKA emission transactions.
+			// SKA emissions use a special authorization format in the signature script
+			// that doesn't follow standard script patterns. Instead, they are validated
+			// through ValidateAuthorizedSKAEmissionTransaction which performs:
+			// - Cryptographic signature verification binding to the transaction
+			// - Admin key authorization checks
+			// - Nonce-based replay protection
+			// - Network ID verification
+			// - Emission window and amount validation
+			// This comprehensive validation happens during block validation, ensuring
+			// SKA emissions are secure despite bypassing standard script checks.
+			if !wire.IsSKAEmissionTransaction(bundledTx.Tx.MsgTx()) {
+				err = g.cfg.ValidateTransactionScripts(bundledTx.Tx, blockUtxos,
+					scriptFlags, isAutoRevocationsEnabled)
+				if err != nil {
+					log.Debugf("Skipping tx %s due to error in "+
+						"ValidateTransactionScripts: %v", bundledTx.Tx.Hash(), err)
+					logSkippedDeps(bundledTx.Tx, deps)
+					miningView.reject(bundledTx.Tx.Hash())
+					continue nextPriorityQueueItem
+				}
 			}
 		}
 
@@ -1776,10 +2461,30 @@ nextPriorityQueueItem:
 			// Add the transaction to the block, increment counters, and
 			// save the fees and signature operation counts to the block
 			// template.
+			if wire.IsSKAEmissionTransaction(bundledTx.MsgTx()) {
+				coinType := blockalloc.GetTransactionCoinType(bundledTx)
+				maturityBlock := nextBlockHeight + int64(g.cfg.ChainParams.CoinbaseMaturity)
+				log.Infof("Added SKA emission transaction %v (coin type %d) to block at height %d, matures at block %d",
+					bundledTx.Hash(), coinType, nextBlockHeight, maturityBlock)
+			} else {
+				log.Debugf("Adding transaction %v to block at height %d", bundledTx.Hash(), nextBlockHeight)
+			}
 			blockTxns = append(blockTxns, bundledTx)
 			blockSize += uint32(bundledTx.MsgTx().SerializeSize())
 			bundledTxSigOps := int64(bundledTxDesc.TotalSigOps)
 			blockSigOps += bundledTxSigOps
+
+			// Update block space allocation tracking
+			transactionTracker.AddTransaction(bundledTx)
+
+			// Record transaction fee for coin-type-specific fee estimation
+			// Skip feeless system transactions (votes and revocations) from fee statistics
+			if g.cfg.FeeCalculator != nil && bundledTxDesc.Type != stake.TxTypeSSGen && bundledTxDesc.Type != stake.TxTypeSSRtx {
+				bundledCoinType := blockalloc.GetTransactionCoinType(bundledTx)
+				bundledSize := int64(bundledTx.MsgTx().SerializeSize())
+				g.cfg.FeeCalculator.RecordTransactionFee(bundledCoinType,
+					bundledTxDesc.Fee, bundledSize, true)
+			}
 
 			// Accumulate the SStxs in the block, because only a certain number
 			// are allowed.
@@ -1807,6 +2512,7 @@ nextPriorityQueueItem:
 			// block template.
 			bundledTxDeps := miningView.children(bundledTxHash)
 			miningView.RemoveTransaction(bundledTxHash, false)
+			log.Debugf("Removed transaction %v from mining view, priority queue length now: %d", bundledTxHash, priorityQueue.Len())
 
 			// Add transactions which depend on this one (and also do not
 			// have any other unsatisfied dependencies) to the priority
@@ -1854,6 +2560,52 @@ nextPriorityQueueItem:
 		goto nextPriorityQueueItem
 	}
 
+	// Log block space allocation results and update fee calculator with utilization data
+	allocation := transactionTracker.GetAllocation()
+	log.Debugf("Block space allocation: %.1f%% utilization (%d/%d bytes used)",
+		allocation.GetUtilizationPercentage(), allocation.TotalUsed, allocation.TotalAllocated)
+
+	// Pre-bucket pending transactions by coin type for performance (O(n) instead of O(n*m))
+	var pendingBuckets map[cointype.CoinType]struct {
+		count int
+		size  int64
+	}
+	if g.cfg.FeeCalculator != nil {
+		pendingBuckets = make(map[cointype.CoinType]struct {
+			count int
+			size  int64
+		})
+		pendingTxs := miningView.TxDescs()
+		for _, txDesc := range pendingTxs {
+			coinType := blockalloc.GetTransactionCoinType(txDesc.Tx)
+			bucket := pendingBuckets[coinType]
+			bucket.count++
+			bucket.size += int64(txDesc.Tx.MsgTx().SerializeSize())
+			pendingBuckets[coinType] = bucket
+		}
+	}
+
+	for coinType, coinAlloc := range allocation.Allocations {
+		if coinAlloc.UsedBytes > 0 {
+			log.Debugf("  Coin type %d: %d bytes used (%.1f%% of allocation)",
+				coinType, coinAlloc.UsedBytes,
+				float64(coinAlloc.UsedBytes)/float64(coinAlloc.FinalAllocation)*100.0)
+		}
+
+		// Update fee calculator with utilization feedback for dynamic adjustment
+		if g.cfg.FeeCalculator != nil {
+			var utilizationRate float64
+			if coinAlloc.FinalAllocation > 0 {
+				utilizationRate = float64(coinAlloc.UsedBytes) / float64(coinAlloc.FinalAllocation)
+			}
+			// utilizationRate is 0.0 if allocation is 0 (no space allocated)
+
+			bucket := pendingBuckets[coinType]
+			g.cfg.FeeCalculator.UpdateUtilization(coinType,
+				bucket.count, bucket.size, utilizationRate)
+		}
+	}
+
 	// Build tx list for stake tx.
 	blockTxnsStake := make([]*dcrutil.Tx, 0, len(blockTxns))
 
@@ -1881,11 +2633,12 @@ nextPriorityQueueItem:
 	}
 
 	// Stake tx ordering in stake tree:
-	// 1. Stakebase
-	// 2. SSGen (votes).
-	// 3. SStx (fresh stake tickets).
-	// 4. SSRtx (revocations for missed tickets).
-	// 5. Stuff treasury payout in stake tree.
+	// 1. Stakebase/TreasuryBase (if treasury enabled)
+	// 2. SSGen (votes)
+	// 3. SSFee (non-VAR fee distributions to stakers)
+	// 4. SStx (fresh stake tickets)
+	// 5. SSRtx (revocations for missed tickets)
+	// 6. TAdd/TSpend (treasury operations if enabled)
 
 	// We have to figure out how many voters we have before adding the
 	// stakebase transaction.
@@ -1938,6 +2691,15 @@ nextPriorityQueueItem:
 	// Add the votes to blockTxnsStake since treasuryBase needs to come
 	// first.
 	blockTxnsStake = append(blockTxnsStake, votes...)
+
+	// Create SSFee transactions for non-VAR fees if we have voters
+	// This must happen after votes are added but before fresh stake tickets
+	var ssFeeTxns []*dcrutil.Tx
+	if nextBlockHeight >= stakeValidationHeight && voters > 0 {
+		// We'll calculate the fee split after all regular transactions are processed
+		// For now, just track that we need to create SSFee transactions
+		// The actual creation will happen after totalFees is calculated
+	}
 
 	// Set votebits, which determines whether the TxTreeRegular of the previous
 	// block is valid or not.
@@ -2094,7 +2856,10 @@ nextPriorityQueueItem:
 			return nil, fmt.Errorf("couldn't find fee for tx %v",
 				*tx.Hash())
 		}
-		totalFees += fee
+
+		// Determine coin type for this transaction and add fees by type
+		coinType := blockalloc.GetTransactionCoinType(tx)
+		totalFees.Add(coinType, fee)
 		txFees = append(txFees, fee)
 
 		tsos, ok := txSigOpCountsMap[*tx.Hash()]
@@ -2111,7 +2876,10 @@ nextPriorityQueueItem:
 			return nil, fmt.Errorf("couldn't find fee for stx %v",
 				*tx.Hash())
 		}
-		totalFees += fee
+
+		// Determine coin type for this transaction and add fees by type
+		coinType := blockalloc.GetTransactionCoinType(tx)
+		totalFees.Add(coinType, fee)
 		txFees = append(txFees, fee)
 
 		tsos, ok := txSigOpCountsMap[*tx.Hash()]
@@ -2122,11 +2890,104 @@ nextPriorityQueueItem:
 		txSigOpCounts = append(txSigOpCounts, tsos)
 	}
 
-	// Scale the fees according to the number of voters once stake validation
-	// height is reached.
+	// Distribute fees once stake validation height is reached.
+	// Note: Unlike subsidies, fees are NOT scaled by voter count.
+	// Fees are distributed fully among actual voters since we know the
+	// exact voter count at block template time. This differs from subsidies
+	// where wallets create vote transactions before knowing the final count.
 	if nextBlockHeight >= stakeValidationHeight {
-		totalFees *= int64(voters)
-		totalFees /= int64(g.cfg.ChainParams.TicketsPerBlock)
+		// Get subsidy proportions for fee splitting
+		work, stake, _, _ := standalone.GetSubsidyProportions(subsidySplitVariant)
+
+		// Calculate fee split between miners and stakers
+		minerFees, stakerFees := wire.CalcFeeSplitByCoinType(totalFees, work, stake)
+
+		// Create SSFee transactions for staker fees if there are voters
+		if voters > 0 {
+			// Create SSFee transactions for each coin type with staker fees
+			for coinType, stakerFee := range stakerFees {
+				if stakerFee <= 0 {
+					continue
+				}
+
+				// Create batched SSFee transactions for this coin type (one per consolidation address)
+				// Use SSFeeIndex for UTXO augmentation if available
+				// Note: Both VAR and non-VAR staker fees use SSFee (only VAR miner fees go to coinbase)
+				voterSSFeeTxns, err := createSSFeeTxBatched(coinType, stakerFee, votes, nextBlockHeight,
+					g.cfg.SSFeeIndex, blockUtxos, g.cfg.FetchUtxoEntry, g)
+				if err != nil {
+					// Critical error: staker fees cannot be distributed
+					// This is a serious issue as fees would be lost if we continue
+					return nil, fmt.Errorf("failed to create staker SSFee txs for coin type %d (amount: %d): %w",
+						coinType, stakerFee, err)
+				}
+
+				// Add all voter SSFee transactions to stake tree
+				for _, ssFeeTx := range voterSSFeeTxns {
+					ssFeeTxns = append(ssFeeTxns, ssFeeTx)
+					blockTxnsStake = append(blockTxnsStake, ssFeeTx)
+
+					// Update block size
+					blockSize += uint32(ssFeeTx.MsgTx().SerializeSize())
+
+					// Track for fee accounting (SSFee has no input fees)
+					txFeesMap[*ssFeeTx.Hash()] = 0
+					txSigOpCountsMap[*ssFeeTx.Hash()] = 0
+
+					// Update the UTXO view with SSFee transaction outputs so they are
+					// available for validation and future augmentation
+					spendTransaction(blockUtxos, ssFeeTx, nextBlockHeight, isTreasuryEnabled)
+				}
+
+				log.Debugf("Created %d SSFee txs for coin type %d, distributing %d total to %d voters",
+					len(voterSSFeeTxns), coinType, stakerFee, voters)
+			}
+		}
+
+		// Create miner SSFee transactions for non-VAR miner fees
+		// This distributes non-VAR fees to miners through SSFee transactions
+		// instead of adding them to the coinbase, maintaining coin type separation
+		for coinType, minerFee := range minerFees {
+			if coinType == cointype.CoinTypeVAR {
+				// VAR fees go to coinbase, not SSFee
+				continue
+			}
+			if minerFee <= 0 {
+				continue
+			}
+
+			// Create miner SSFee transaction for this coin type
+			// Uses SSFeeIndex to find existing miner SSFee UTXOs for consolidation
+			minerSSFeeTx, err := createMinerSSFeeTx(coinType, minerFee, payToAddress, nextBlockHeight, g.cfg.SSFeeIndex, blockUtxos, g.cfg.FetchUtxoEntry, g)
+			if err != nil {
+				// Critical error: miner fees cannot be distributed
+				// This is a serious issue as fees would be lost if we continue
+				return nil, fmt.Errorf("failed to create miner SSFee tx for coin type %d (amount: %d): %w",
+					coinType, minerFee, err)
+			}
+
+			// Add to stake tree transactions
+			ssFeeTxns = append(ssFeeTxns, minerSSFeeTx)
+			blockTxnsStake = append(blockTxnsStake, minerSSFeeTx)
+
+			// Update block size
+			blockSize += uint32(minerSSFeeTx.MsgTx().SerializeSize())
+
+			// Track for fee accounting (SSFee has no input fees)
+			txFeesMap[*minerSSFeeTx.Hash()] = 0
+			txSigOpCountsMap[*minerSSFeeTx.Hash()] = 0
+
+			// Update the UTXO view with miner SSFee transaction outputs so they are
+			// available for validation and future augmentation
+			spendTransaction(blockUtxos, minerSSFeeTx, nextBlockHeight, isTreasuryEnabled)
+
+		}
+
+		// Now update totalFees to only include VAR miner fees for the coinbase
+		// All non-VAR fees have been distributed via SSFee transactions
+		varFeesOnly := wire.NewFeesByType()
+		varFeesOnly.Add(cointype.CoinTypeVAR, minerFees.Get(cointype.CoinTypeVAR))
+		totalFees = varFeesOnly
 	}
 
 	txSigOpCounts = append(txSigOpCounts, numCoinbaseSigOps)
@@ -2142,8 +3003,13 @@ nextPriorityQueueItem:
 		if isTreasuryEnabled {
 			powOutputIdx = 1
 		}
-		coinbaseTx.MsgTx().TxOut[powOutputIdx].Value += totalFees
-		txFees[0] = -totalFees
+		// Add VAR fees to coinbase - only VAR fees go to the PoW output
+		// Non-VAR fees have already been distributed via miner SSFee transactions
+		varFees := totalFees.Get(cointype.CoinTypeVAR)
+		if varFees > 0 {
+			coinbaseTx.MsgTx().TxOut[powOutputIdx].Value += varFees
+		}
+		txFees[0] = -totalFees.Total()
 	}
 
 	// Calculate the required difficulty for the block.  The timestamp
@@ -2211,8 +3077,8 @@ nextPriorityQueueItem:
 
 	// Fill in locally referenced inputs.
 	for i, tx := range blockTxnsRegular {
-		// Skip coinbase.
-		if i == 0 {
+		// Skip coinbase and SKA emission
+		if i == 0 || wire.IsSKAEmissionTransaction(tx.MsgTx()) {
 			continue
 		}
 
@@ -2300,8 +3166,9 @@ nextPriorityQueueItem:
 	if err != nil {
 		return nil, err
 	}
-	msgBlock.Header.MerkleRoot = calcBlockMerkleRoot(msgBlock.Transactions,
+	calculatedMerkleRoot := calcBlockMerkleRoot(msgBlock.Transactions,
 		msgBlock.STransactions, hdrCmtActive)
+	msgBlock.Header.MerkleRoot = calculatedMerkleRoot
 
 	// Calculate the stake root or commitment root depending on the result of
 	// the header commitments agenda vote.
@@ -2328,14 +3195,15 @@ nextPriorityQueueItem:
 	if err != nil {
 		str := fmt.Sprintf("failed to do final check for check connect "+
 			"block when making new block template: %v", err)
+		log.Debugf(str)
 		return nil, makeError(ErrCheckConnectBlock, str)
 	}
 
 	log.Debugf("Created new block template (%d transactions, %d stake "+
-		"transactions, %d treasury transactions, %d in fees, %d signature "+
+		"transactions (%d SSFee), %d treasury transactions, %d in fees, %d signature "+
 		"operations, %d bytes, target difficulty %064x, stake difficulty %v)",
 		len(msgBlock.Transactions), len(msgBlock.STransactions),
-		totalTreasuryOps, totalFees, blockSigOps, blockSize,
+		len(ssFeeTxns), totalTreasuryOps, totalFees.Total(), blockSigOps, blockSize,
 		standalone.CompactToBig(msgBlock.Header.Bits),
 		dcrutil.Amount(msgBlock.Header.SBits).ToCoin())
 

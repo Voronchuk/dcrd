@@ -16,9 +16,11 @@ import (
 	"github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/internal/blockchain"
 	"github.com/decred/dcrd/internal/blockchain/indexers"
+	"github.com/decred/dcrd/internal/fees"
 	"github.com/decred/dcrd/internal/mining"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/wire"
@@ -27,7 +29,7 @@ import (
 const (
 	// maxRelayFeeMultiplier is the factor that we disallow fees / kB above the
 	// minimum tx fee.  At the current default minimum relay fee of 0.0001
-	// DCR/kB, this results in a maximum allowed high fee of 1 DCR/kB.
+	// VAR/kB, this results in a maximum allowed high fee of 1 VAR/kB.
 	maxRelayFeeMultiplier = 1e4
 
 	// maxVoteDoubleSpends is the maximum number of vote double spends allowed
@@ -98,6 +100,21 @@ type Config struct {
 	// BestHeight defines the function to use to access the block height of
 	// the current best chain.
 	BestHeight func() int64
+
+	// HasSKAEmissionOccurred defines the function to check if an SKA emission
+	// has already occurred for the specified coin type.
+	// This is used to prevent duplicate emissions in the mempool.
+	HasSKAEmissionOccurred func(cointype.CoinType) bool
+
+	// GetSKAEmissionNonce defines the function to get the current nonce
+	// for an SKA coin type.
+	GetSKAEmissionNonce func(cointype.CoinType) uint64
+
+	// HasVotePassedAtHeight checks if a consensus vote has passed and is active
+	// at the specified block height. This is used to validate SKA-2+ emissions
+	// which require stakeholder approval before they can be mined.
+	// Returns false if the vote doesn't exist or hasn't activated yet.
+	HasVotePassedAtHeight func(voteID string, height int64) bool
 
 	// HeaderByHash returns the block header identified by the given hash or an
 	// error if it doesn't exist.  Note that this will return headers from both
@@ -186,7 +203,7 @@ type Policy struct {
 	// of the max signature operations for a block.
 	MaxSigOpsPerTx int
 
-	// MinRelayTxFee defines the minimum transaction fee in DCR/kB to be
+	// MinRelayTxFee defines the minimum transaction fee in VAR/kB to be
 	// considered a non-zero fee.
 	MinRelayTxFee dcrutil.Amount
 
@@ -266,11 +283,35 @@ type TxPool struct {
 	// TSpends. Access MUST be protected by the mempool mutex.
 	tspends map[chainhash.Hash]*dcrutil.Tx
 
+	// SKA emissions. Access MUST be protected by the mempool mutex.
+	// Tracks one emission per SKA coin type to prevent duplicates.
+	skaEmissions map[cointype.CoinType]*chainhash.Hash
+
 	// nextExpireScan is the time after which the orphan pool will be
 	// scanned in order to evict orphans.  This is NOT a hard deadline as
 	// the scan will only run when an orphan is added to the pool as opposed
 	// to on an unconditional timer.
 	nextExpireScan time.Time
+
+	// feeCalculator for advanced fee calculation and validation
+	feeCalculator *fees.CoinTypeFeeCalculator
+}
+
+// mempoolChainAdapter adapts the mempool's function-based blockchain access
+// to the interface expected by ValidateAuthorizedSKAEmissionTransaction.
+type mempoolChainAdapter struct {
+	hasEmissionOccurred func(cointype.CoinType) bool
+	getEmissionNonce    func(cointype.CoinType) uint64
+}
+
+// HasSKAEmissionOccurred checks if SKA emission has occurred for the given coin type.
+func (m *mempoolChainAdapter) HasSKAEmissionOccurred(coinType cointype.CoinType) bool {
+	return m.hasEmissionOccurred(coinType)
+}
+
+// GetSKAEmissionNonce returns the current nonce for the given coin type.
+func (m *mempoolChainAdapter) GetSKAEmissionNonce(coinType cointype.CoinType) uint64 {
+	return m.getEmissionNonce(coinType)
 }
 
 // insertVote inserts a vote into the map of block votes.
@@ -834,6 +875,16 @@ func (mp *TxPool) removeTransaction(tx *dcrutil.Tx, removeRedeemers bool) {
 
 		// Stop tracking if it's a tspend.
 		delete(mp.tspends, *txHash)
+
+		// Stop tracking if it's an SKA emission.
+		if wire.IsSKAEmissionTransaction(tx.MsgTx()) && len(tx.MsgTx().TxOut) > 0 {
+			coinType := tx.MsgTx().TxOut[0].CoinType
+			if emissionHash, exists := mp.skaEmissions[coinType]; exists && emissionHash != nil {
+				if *emissionHash == *txHash {
+					delete(mp.skaEmissions, coinType)
+				}
+			}
+		}
 	}
 }
 
@@ -925,6 +976,18 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint, txDesc *TxD
 	if mp.cfg.AddTxToFeeEstimation != nil {
 		mp.cfg.AddTxToFeeEstimation(txHash, txDesc.Fee, txDesc.TxSize, txType)
 	}
+
+	// Record transaction fee for coin-type-specific tracking
+	// Skip feeless system transactions (votes and revocations) from fee statistics
+	if mp.feeCalculator != nil && txDesc.Type != stake.TxTypeSSGen && txDesc.Type != stake.TxTypeSSRtx {
+		// Determine the primary coin type from outputs
+		// (inputs and outputs always have the same coin type)
+		primaryCoinType := mp.determinePrimaryCoinType(msgTx)
+
+		// Record with the primary coin type
+		mp.feeCalculator.RecordTransactionFee(primaryCoinType, txDesc.Fee,
+			txDesc.TxSize, false) // false = not confirmed yet
+	}
 }
 
 // checkPoolDoubleSpend checks whether or not the passed transaction is
@@ -934,6 +997,12 @@ func (mp *TxPool) addTransaction(utxoView *blockchain.UtxoViewpoint, txDesc *TxD
 //
 // This function MUST be called with the mempool lock held (for reads).
 func (mp *TxPool) checkPoolDoubleSpend(tx *dcrutil.Tx, txType stake.TxType, isTreasuryEnabled bool) error {
+	// SKA emission transactions have null inputs that don't represent real coins
+	// being spent, so skip double-spend checks for them entirely.
+	if wire.IsSKAEmissionTransaction(tx.MsgTx()) {
+		return nil
+	}
+
 	for i, txIn := range tx.MsgTx().TxIn {
 		// We don't care about double spends of stake bases.
 		if i == 0 && (txType == stake.TxTypeSSGen ||
@@ -1235,18 +1304,11 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 	// Determine active agendas based on flags.
 	isTreasuryEnabled := checkTxFlags.IsTreasuryEnabled()
 	isAutoRevocationsEnabled := checkTxFlags.IsAutoRevocationsEnabled()
-	isSubsidyEnabled := checkTxFlags.IsSubsidySplitEnabled()
-	isSubsidyR2Enabled := checkTxFlags.IsSubsidySplitR2Enabled()
 
-	// Determine which subsidy split variant to use depending on the active
-	// agendas.
-	subsidySplitVariant := standalone.SSVOriginal
-	switch {
-	case isSubsidyR2Enabled:
-		subsidySplitVariant = standalone.SSVDCP0012
-	case isSubsidyEnabled:
-		subsidySplitVariant = standalone.SSVDCP0010
-	}
+	// Use Monetarium subsidy split (50% miners, 50% stakers, 0% treasury)
+	// Note: We're not checking DCP agenda activation since we always want
+	// to use the Monetarium split for production
+	subsidySplitVariant := standalone.SSVMonetarium
 
 	// Determine the type of transaction (regular or stake) and be sure to set
 	// the transaction tree correctly as it's possible a user submitted it to
@@ -1266,8 +1328,79 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 		return nil, txRuleError(ErrTreasurybase, str)
 	}
 
-	// A standalone transaction must not be a coinbase transaction.
-	if standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled) {
+	// SKA emission transactions require full cryptographic authorization.
+	// Check this BEFORE coinbase check since SKA emissions have null previous outputs.
+	if wire.IsSKAEmissionTransaction(msgTx) {
+		// Get the next block height for validation
+		bestHeight := mp.cfg.BestHeight()
+		nextBlockHeight := bestHeight + 1
+
+		// SECURITY FIX: Check if this coin type has already been emitted
+		// This prevents duplicate emissions from entering the mempool
+		if len(msgTx.TxOut) > 0 {
+			coinType := msgTx.TxOut[0].CoinType
+
+			// Check blockchain state
+			if mp.cfg.HasSKAEmissionOccurred != nil && mp.cfg.HasSKAEmissionOccurred(coinType) {
+				str := fmt.Sprintf("transaction %v is a duplicate SKA emission - coin type %d has already been emitted",
+					txHash, coinType)
+				return nil, txRuleError(ErrDuplicate, str)
+			}
+
+			// Check mempool state
+			if existingEmission, exists := mp.skaEmissions[coinType]; exists && existingEmission != nil {
+				str := fmt.Sprintf("transaction %v is a duplicate SKA emission - coin type %d already has pending emission %v in mempool",
+					txHash, coinType, existingEmission)
+				return nil, txRuleError(ErrDuplicate, str)
+			}
+
+			// SKA-2 and higher require stakeholder vote activation
+			// Only accept to mempool if vote has passed (ready to mine)
+			if coinType >= 2 {
+				voteID := fmt.Sprintf("activateska%d", coinType)
+				if mp.cfg.HasVotePassedAtHeight != nil {
+					if !mp.cfg.HasVotePassedAtHeight(voteID, nextBlockHeight) {
+						str := fmt.Sprintf("transaction %v cannot be accepted - stakeholder vote %s has not activated coin type %d yet (resubmit after vote passes)",
+							txHash, voteID, coinType)
+						return nil, txRuleError(ErrInvalid, str)
+					}
+				}
+			}
+
+			// Check emission window
+			if config, exists := mp.cfg.ChainParams.SKACoins[coinType]; exists {
+				emissionStart := int64(config.EmissionHeight)
+				emissionEnd := emissionStart + int64(config.EmissionWindow)
+
+				if nextBlockHeight < emissionStart {
+					str := fmt.Sprintf("transaction %v is outside emission window - too early (emission starts at block %d, current height %d)",
+						txHash, emissionStart, bestHeight)
+					return nil, txRuleError(ErrInvalid, str)
+				}
+
+				if nextBlockHeight > emissionEnd {
+					str := fmt.Sprintf("transaction %v is outside emission window - expired (emission ended at block %d, current height %d)",
+						txHash, emissionEnd, bestHeight)
+					return nil, txRuleError(ErrInvalid, str)
+				}
+			}
+		}
+
+		// Create a chain adapter to provide blockchain state access for secure validation
+		chainAdapter := &mempoolChainAdapter{
+			hasEmissionOccurred: mp.cfg.HasSKAEmissionOccurred,
+			getEmissionNonce:    mp.cfg.GetSKAEmissionNonce,
+		}
+
+		// Perform full cryptographic validation including signature verification
+		// This ensures invalid emission transactions cannot enter the mempool
+		if err := blockchain.ValidateAuthorizedSKAEmissionTransaction(msgTx, nextBlockHeight, chainAdapter, mp.cfg.ChainParams); err != nil {
+			str := fmt.Sprintf("transaction %v is an invalid authorized SKA emission transaction: %v", txHash, err)
+			return nil, txRuleError(ErrInvalid, str)
+		}
+	} else if standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled) {
+		// A standalone transaction must not be a coinbase transaction.
+		// SKA emissions are excluded above since they also have null previous outputs.
 		str := fmt.Sprintf("transaction %v is an individual coinbase",
 			txHash)
 		return nil, txRuleError(ErrCoinbase, str)
@@ -1278,6 +1411,23 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 	// one more than the current height.
 	bestHeight := mp.cfg.BestHeight()
 	nextBlockHeight := bestHeight + 1
+
+	// Check if transaction has SKA outputs and validate all coin types are active
+	usedSKACoinTypes := make(map[cointype.CoinType]bool)
+	for _, txOut := range msgTx.TxOut {
+		if txOut.CoinType.IsSKA() {
+			usedSKACoinTypes[txOut.CoinType] = true
+		}
+	}
+
+	// Validate all used SKA coin types are active
+	for coinType := range usedSKACoinTypes {
+		if !mp.cfg.ChainParams.IsSKACoinTypeActive(coinType) {
+			str := fmt.Sprintf("transaction %v uses inactive SKA coin type %d",
+				txHash, coinType)
+			return nil, txRuleError(ErrInvalid, str)
+		}
+	}
 
 	// Don't accept transactions that will be expired as of the next block.
 	if blockchain.IsExpired(tx, nextBlockHeight) {
@@ -1420,6 +1570,25 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 		return nil, err
 	}
 
+	// Check that input SKA coin types are active (defensive check)
+	// This must be done after fetchInputUtxos so we have the UTXO view
+	for i, txIn := range msgTx.TxIn {
+		// Skip special inputs
+		if (i == 0 && isVote) || isTSpend || wire.IsSKAEmissionTransaction(msgTx) {
+			continue
+		}
+
+		entry := utxoView.LookupEntry(txIn.PreviousOutPoint)
+		if entry != nil && !entry.IsSpent() {
+			coinType := entry.CoinType()
+			if coinType.IsSKA() && !mp.cfg.ChainParams.IsSKACoinTypeActive(coinType) {
+				str := fmt.Sprintf("transaction %v spends inactive SKA coin type %d",
+					txHash, coinType)
+				return nil, txRuleError(ErrInvalid, str)
+			}
+		}
+	}
+
 	// Don't allow the transaction if it exists in the main chain and is not
 	// already fully spent.
 	outpoint := wire.OutPoint{Hash: *txHash, Tree: tree}
@@ -1436,8 +1605,10 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 	// don't exist or are already spent.
 	var missingParents []wire.OutPoint
 	var updateFraudProof bool
+	isSKAEmission := wire.IsSKAEmissionTransaction(msgTx)
+	isSSFee := txType == stake.TxTypeSSFee
 	for i, txIn := range msgTx.TxIn {
-		if (i == 0 && isVote) || isTSpend {
+		if (i == 0 && isVote) || isTSpend || isSKAEmission || isSSFee {
 			continue
 		}
 
@@ -1489,8 +1660,8 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 		msgTx = tx.MsgTx()
 
 		for i, txIn := range msgTx.TxIn {
-			// Skip stakebase inputs and treasury spends.
-			if (i == 0 && isVote) || isTSpend {
+			// Skip stakebase inputs, treasury spends, SKA emissions, and SSFee.
+			if (i == 0 && isVote) || isTSpend || isSKAEmission || isSSFee {
 				continue
 			}
 
@@ -1576,6 +1747,7 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 	// the maximum allowed signature operations per block.
 	numP2SHSigOps, err := blockchain.CountP2SHSigOps(tx, false,
 		(txType == stake.TxTypeSSGen), utxoView, isTreasuryEnabled)
+
 	if err != nil {
 		var cerr blockchain.RuleError
 		if errors.As(err, &cerr) {
@@ -1609,39 +1781,91 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 	// - Votes
 	isTreasuryAdd := isTreasuryEnabled && txType == stake.TxTypeTAdd
 	serializedSize := int64(msgTx.SerializeSize())
-	minFee := calcMinRequiredTxRelayFee(serializedSize,
-		mp.cfg.Policy.MinRelayTxFee)
-	if txFee < minFee && (txType == stake.TxTypeRegular || isTicket ||
-		isTreasuryAdd || isTSpend) {
 
-		var txTypeStr string
-		switch {
-		case txType == stake.TxTypeRegular:
-			txTypeStr = "regular "
-		case isTicket:
-			txTypeStr = "ticket purchase "
-		case isTreasuryAdd:
-			txTypeStr = "treasury add "
-		case isTSpend:
-			txTypeStr = "treasury spend "
-		}
-		str := fmt.Sprintf("%stransaction %s pays a fee of %d atoms which is "+
-			"under the required fee of %d atoms for a %d-byte transaction",
-			txTypeStr, txHash, txFee, minFee, serializedSize)
-		return nil, txRuleError(ErrInsufficientFee, str)
+	// Validate coin type consistency (no VAR↔SKA crosses)
+	if err := mp.validateCoinTypeConsistency(tx, utxoView); err != nil {
+		return nil, err
 	}
 
-	// Check whether allowHighFees is set to false (default), if so, then make
-	// sure the current fee is sensible.  If people would like to avoid this
-	// check then they can AllowHighFees = true
-	if !allowHighFees {
-		maxFee := calcMinRequiredTxRelayFee(serializedSize*maxRelayFeeMultiplier,
-			mp.cfg.Policy.MinRelayTxFee)
-		if txFee > maxFee {
-			str := fmt.Sprintf("transaction %v has %v fee which is above the "+
-				"allowHighFee check threshold amount of %v", txHash,
-				txFee, maxFee)
-			return nil, txRuleError(ErrFeeTooHigh, str)
+	// Determine primary coin type from outputs
+	// (inputs and outputs always have the same coin type, already validated above)
+	primaryCoinType := mp.determinePrimaryCoinType(msgTx)
+
+	// SKA can only be used for regular transactions (not stake/treasury)
+	if primaryCoinType.IsSKA() && txType != stake.TxTypeRegular {
+		return nil, txRuleError(ErrInvalid,
+			fmt.Sprintf("SKA coin type %d cannot be used for %v transactions",
+				primaryCoinType, txType))
+	}
+
+	// Calculate fees per coin type
+	feesByType, err := mp.computeFeesByType(utxoView, msgTx, txType)
+	if err != nil {
+		return nil, txRuleError(ErrInvalid, fmt.Sprintf("fee calculation error: %v", err))
+	}
+
+	// Get the actual fee for the primary coin type
+	actualFee := int64(0)
+	if fee, exists := feesByType[primaryCoinType]; exists {
+		actualFee = fee
+	} else if !isSKAEmission {
+		// For non-emission transactions, if we didn't find a fee for the primary coin type,
+		// it means the transaction has no inputs (which should have been caught earlier)
+		// Use the consensus-calculated fee as fallback
+		actualFee = txFee
+	}
+
+	// Validate fees for transactions that require them
+	// Note: TSpend transactions are feeless, so we exclude them from fee validation
+	if !isSKAEmission && !isTSpend && (txType == stake.TxTypeRegular || isTicket || isTreasuryAdd) {
+		// Calculate minimum fee for the coin type
+		var minFee int64
+		if mp.feeCalculator != nil {
+			minFee = mp.feeCalculator.CalculateMinFee(serializedSize, primaryCoinType)
+		} else {
+			minFee = mp.calculateLegacyMinFee(msgTx, serializedSize, primaryCoinType)
+		}
+
+		if actualFee < minFee {
+			var txTypeStr string
+			switch {
+			case txType == stake.TxTypeRegular:
+				txTypeStr = "regular "
+			case isTicket:
+				txTypeStr = "ticket purchase "
+			case isTreasuryAdd:
+				txTypeStr = "treasury add "
+			case isTSpend:
+				txTypeStr = "treasury spend "
+			}
+
+			coinTypeStr := ""
+			if primaryCoinType.IsSKA() {
+				coinTypeStr = fmt.Sprintf(" (SKA-%d)", primaryCoinType)
+			}
+
+			str := fmt.Sprintf("%stransaction %s%s pays a fee of %d atoms which is "+
+				"under the required fee of %d atoms for a %d-byte transaction",
+				txTypeStr, txHash, coinTypeStr, actualFee, minFee, serializedSize)
+			return nil, txRuleError(ErrInsufficientFee, str)
+		}
+
+		// Check for excessively high fees
+		if !allowHighFees {
+			var maxFee int64
+			if mp.feeCalculator != nil {
+				// Use a reasonable multiplier for max fee (e.g., 100x min fee)
+				maxFee = minFee * 100
+			} else {
+				maxFee = mp.calculateLegacyMaxFee(msgTx, serializedSize, primaryCoinType)
+			}
+
+			if actualFee > maxFee {
+				str := fmt.Sprintf("transaction %v has %v fee which is above the "+
+					"allowHighFee check threshold amount of %v", txHash,
+					actualFee, maxFee)
+				return nil, txRuleError(ErrFeeTooHigh, str)
+			}
 		}
 	}
 
@@ -1781,6 +2005,12 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 	// Keep track of tspends separately.
 	if isTSpend {
 		mp.tspends[*txHash] = tx
+	}
+
+	// Keep track of SKA emissions separately.
+	if wire.IsSKAEmissionTransaction(msgTx) && len(msgTx.TxOut) > 0 {
+		coinType := msgTx.TxOut[0].CoinType
+		mp.skaEmissions[coinType] = txHash
 	}
 
 	log.Debugf("Accepted transaction %v (pool size: %v)", txHash,
@@ -2344,6 +2574,7 @@ func New(cfg *Config) *TxPool {
 		outpoints:       make(map[wire.OutPoint]*TxDesc),
 		votes:           make(map[chainhash.Hash][]mining.VoteDesc),
 		tspends:         make(map[chainhash.Hash]*dcrutil.Tx),
+		skaEmissions:    make(map[cointype.CoinType]*chainhash.Hash),
 		nextExpireScan:  time.Now().Add(orphanExpireScanInterval),
 		staged:          make(map[chainhash.Hash]*TxDesc),
 		stagedOutpoints: make(map[wire.OutPoint]*TxDesc),
@@ -2366,5 +2597,296 @@ func New(cfg *Config) *TxPool {
 	mp.miningView = mining.NewTxMiningView(cfg.Policy.EnableAncestorTracking,
 		forEachRedeemer)
 
+	// Initialize fee calculator for coin-type-specific fee validation
+	mp.feeCalculator = fees.NewCoinTypeFeeCalculator(cfg.ChainParams, cfg.Policy.MinRelayTxFee)
+
 	return mp
+}
+
+// computeFeesByType calculates the transaction fees for each coin type involved.
+// For our single-coin-type transactions, this will return a map with one entry.
+func (mp *TxPool) computeFeesByType(utxoView *blockchain.UtxoViewpoint,
+	msgTx *wire.MsgTx, txType stake.TxType) (map[cointype.CoinType]int64, error) {
+
+	fees := make(map[cointype.CoinType]int64)
+
+	// Special handling for votes and revocations which are feeless
+	// and can have outputs > inputs due to rewards
+	if txType == stake.TxTypeSSGen || txType == stake.TxTypeSSRtx {
+		// Votes and revocations are always VAR and feeless
+		fees[cointype.CoinTypeVAR] = 0
+		return fees, nil
+	}
+
+	// SKA emissions have no real inputs, they are feeless
+	if wire.IsSKAEmissionTransaction(msgTx) {
+		if len(msgTx.TxOut) > 0 {
+			fees[msgTx.TxOut[0].CoinType] = 0
+		}
+		return fees, nil
+	}
+
+	// Treasury transactions are also feeless (TSpend, but TAdd still needs fees)
+	if txType == stake.TxTypeTSpend {
+		fees[cointype.CoinTypeVAR] = 0
+		return fees, nil
+	}
+
+	// Sum inputs by coin type
+	var inputSums = make(map[cointype.CoinType]int64)
+	for _, txIn := range msgTx.TxIn {
+		entry := utxoView.LookupEntry(txIn.PreviousOutPoint)
+		if entry == nil || entry.IsSpent() {
+			// Will be handled as orphan
+			continue
+		}
+
+		coinType := entry.CoinType()
+		inputSums[coinType] += entry.Amount()
+	}
+
+	// Sum outputs by coin type
+	var outputSums = make(map[cointype.CoinType]int64)
+	for _, txOut := range msgTx.TxOut {
+		outputSums[txOut.CoinType] += txOut.Value
+	}
+
+	// Calculate fees as inputs - outputs for each coin type
+	for coinType, inputSum := range inputSums {
+		outputSum := outputSums[coinType]
+		fee := inputSum - outputSum
+		if fee < 0 {
+			return nil, fmt.Errorf("negative fee for coin type %v: inputs=%d, outputs=%d",
+				coinType, inputSum, outputSum)
+		}
+		fees[coinType] = fee
+	}
+
+	return fees, nil
+}
+
+// determinePrimaryCoinType determines the primary coin type for a transaction
+// based on the majority of its outputs.
+// Since inputs and outputs always have the same coin type after validation,
+// this provides an efficient way to determine the transaction's coin type.
+func (mp *TxPool) determinePrimaryCoinType(msgTx *wire.MsgTx) cointype.CoinType {
+	// Count outputs by coin type
+	coinTypeCounts := make(map[cointype.CoinType]int)
+	for _, txOut := range msgTx.TxOut {
+		coinTypeCounts[txOut.CoinType]++
+	}
+
+	// Find the coin type with the most outputs
+	var primaryCoinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR
+	maxCount := 0
+	for coinType, count := range coinTypeCounts {
+		if count > maxCount {
+			maxCount = count
+			primaryCoinType = coinType
+		}
+	}
+
+	return primaryCoinType
+}
+
+// calculateLegacyMinFee calculates minimum fee using legacy logic for fallback
+func (mp *TxPool) calculateLegacyMinFee(msgTx *wire.MsgTx, serializedSize int64, primaryCoinType cointype.CoinType) int64 {
+	if primaryCoinType.IsSKA() {
+		return calcMinRequiredTxRelayFeeForCoinType(serializedSize,
+			primaryCoinType, mp.cfg.Policy.MinRelayTxFee, mp.cfg.ChainParams)
+	} else {
+		return calcMinRequiredTxRelayFee(serializedSize, mp.cfg.Policy.MinRelayTxFee)
+	}
+}
+
+// calculateLegacyMaxFee calculates maximum fee using legacy logic for fallback
+func (mp *TxPool) calculateLegacyMaxFee(msgTx *wire.MsgTx, serializedSize int64, primaryCoinType cointype.CoinType) int64 {
+	if primaryCoinType.IsSKA() {
+		return calcMinRequiredTxRelayFeeForCoinType(serializedSize*maxRelayFeeMultiplier,
+			primaryCoinType, mp.cfg.Policy.MinRelayTxFee, mp.cfg.ChainParams)
+	} else {
+		return calcMinRequiredTxRelayFee(serializedSize*maxRelayFeeMultiplier, mp.cfg.Policy.MinRelayTxFee)
+	}
+}
+
+// GetFeeCalculator returns the fee calculator for external use (e.g., RPC)
+func (mp *TxPool) GetFeeCalculator() *fees.CoinTypeFeeCalculator {
+	mp.mtx.RLock()
+	defer mp.mtx.RUnlock()
+	return mp.feeCalculator
+}
+
+// ProcessConfirmedTransactions records confirmed transactions in the dual-coin fee calculator
+// This should be called during block processing before removing transactions from the mempool
+func (mp *TxPool) ProcessConfirmedTransactions(block *dcrutil.Block, isTreasuryEnabled bool) {
+	if mp.feeCalculator == nil {
+		return
+	}
+
+	processConfirmedTxs := func(txns []*dcrutil.Tx) {
+		for _, tx := range txns {
+			mp.mtx.RLock()
+			if poolTxDesc, exists := mp.pool[*tx.Hash()]; exists {
+				// Skip feeless system transactions (votes and revocations) from fee statistics
+				if poolTxDesc.Type != stake.TxTypeSSGen && poolTxDesc.Type != stake.TxTypeSSRtx {
+					// Determine coin type from outputs (inputs and outputs always match)
+					primaryCoinType := mp.determinePrimaryCoinType(tx.MsgTx())
+					txSize := int64(tx.MsgTx().SerializeSize())
+					mp.feeCalculator.RecordTransactionFee(primaryCoinType, poolTxDesc.Fee, txSize, true) // true = confirmed
+				}
+			}
+			mp.mtx.RUnlock()
+		}
+	}
+
+	// Process regular transactions (skip coinbase at index 0)
+	if len(block.Transactions()) > 1 {
+		processConfirmedTxs(block.Transactions()[1:])
+	}
+
+	// Process stake transactions
+	if isTreasuryEnabled {
+		// Skip treasurybase at index 0 if treasury is enabled
+		if len(block.STransactions()) > 1 {
+			processConfirmedTxs(block.STransactions()[1:])
+		}
+	} else {
+		processConfirmedTxs(block.STransactions())
+	}
+}
+
+// validateCoinTypeConsistency ensures that transactions don't mix coin types
+// (VAR inputs can only produce VAR outputs, SKA inputs can only produce SKA outputs)
+func (mp *TxPool) validateCoinTypeConsistency(tx *dcrutil.Tx, utxoView *blockchain.UtxoViewpoint) error {
+	msgTx := tx.MsgTx()
+	txHash := tx.Hash()
+
+	// Check if treasury is enabled for this chain
+	isTreasuryEnabled, err := mp.cfg.IsTreasuryAgendaActive()
+	if err != nil {
+		// If we can't determine treasury status, assume it's not enabled
+		isTreasuryEnabled = false
+	}
+
+	txType := stake.DetermineTxType(msgTx)
+
+	// SKA emission transactions are special - they have no real inputs
+	if wire.IsSKAEmissionTransaction(msgTx) {
+		// Ensure all outputs are the same SKA coin type
+		if len(msgTx.TxOut) == 0 {
+			return txRuleError(ErrInvalid, "SKA emission with no outputs")
+		}
+		firstCoinType := msgTx.TxOut[0].CoinType
+		if !firstCoinType.IsSKA() {
+			return txRuleError(ErrInvalid, "SKA emission must output SKA coins")
+		}
+		for _, txOut := range msgTx.TxOut {
+			if txOut.CoinType != firstCoinType {
+				return txRuleError(ErrMixedCoinTypes,
+					fmt.Sprintf("SKA emission %s has mixed output coin types", txHash))
+			}
+		}
+		return nil
+	}
+
+	// Special handling for stake and treasury transactions
+	switch txType {
+	case stake.TxTypeSSGen, stake.TxTypeSSRtx: // Votes and revocations
+		// These MUST be VAR-only (SKA cannot participate in staking)
+		// Check outputs to ensure no SKA involvement
+		for _, txOut := range msgTx.TxOut {
+			if txOut.CoinType.IsSKA() {
+				return txRuleError(ErrInvalid,
+					fmt.Sprintf("%v transaction %s cannot involve SKA coins",
+						txType, txHash))
+			}
+		}
+		// VAR stake transactions can have mixed operations (e.g., vote payouts)
+		return nil
+
+	case stake.TxTypeSStx: // Ticket purchases
+		// Tickets MUST be VAR-only (SKA cannot participate in staking)
+		for _, txOut := range msgTx.TxOut {
+			if txOut.CoinType.IsSKA() {
+				return txRuleError(ErrInvalid,
+					fmt.Sprintf("ticket purchase %s cannot involve SKA coins", txHash))
+			}
+		}
+		// Fall through to standard validation
+
+	case stake.TxTypeTSpend, stake.TxTypeTAdd: // Treasury transactions
+		if isTreasuryEnabled {
+			// Treasury operations MUST be VAR-only
+			for _, txOut := range msgTx.TxOut {
+				if txOut.CoinType.IsSKA() {
+					return txRuleError(ErrInvalid,
+						fmt.Sprintf("treasury transaction %s cannot involve SKA coins",
+							txHash))
+				}
+			}
+			// VAR treasury transactions may have special rules, allow them
+			return nil
+		}
+	}
+
+	// Collect input coin types
+	inputCoinTypes := make(map[cointype.CoinType]bool)
+	for i, txIn := range msgTx.TxIn {
+		// Skip the stakebase (first input of SSGen transactions)
+		if i == 0 && txType == stake.TxTypeSSGen {
+			continue
+		}
+
+		// Get the UTXO being spent
+		entry := utxoView.LookupEntry(txIn.PreviousOutPoint)
+		if entry == nil {
+			// This will be caught by other validation, skip for now
+			continue
+		}
+
+		inputCoinType := entry.CoinType()
+		inputCoinTypes[inputCoinType] = true
+	}
+
+	// Collect output coin types
+	outputCoinTypes := make(map[cointype.CoinType]bool)
+	for _, txOut := range msgTx.TxOut {
+		outputCoinTypes[txOut.CoinType] = true
+	}
+
+	// Check for mixed coin types
+	if len(inputCoinTypes) > 1 {
+		return txRuleError(ErrMixedCoinTypes,
+			fmt.Sprintf("transaction %s has mixed input coin types", txHash))
+	}
+
+	if len(outputCoinTypes) > 1 {
+		return txRuleError(ErrMixedCoinTypes,
+			fmt.Sprintf("transaction %s has mixed output coin types", txHash))
+	}
+
+	// Check that input and output coin types match
+	if len(inputCoinTypes) > 0 && len(outputCoinTypes) > 0 {
+		var inputCoinType, outputCoinType cointype.CoinType
+
+		// Get the single input coin type
+		for ct := range inputCoinTypes {
+			inputCoinType = ct
+			break
+		}
+
+		// Get the single output coin type
+		for ct := range outputCoinTypes {
+			outputCoinType = ct
+			break
+		}
+
+		if inputCoinType != outputCoinType {
+			return txRuleError(ErrMixedCoinTypes,
+				fmt.Sprintf("transaction %s attempts to convert coin type %d to %d",
+					txHash, inputCoinType, outputCoinType))
+		}
+	}
+
+	return nil
 }

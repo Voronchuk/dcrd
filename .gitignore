@@ -20,6 +20,7 @@ _test
 vendor
 .idea
 .vscode
+.claude
 playground
 notes
 
@@ -47,6 +48,7 @@ _testmain.go
 # Binaries
 *.exe
 dcrd
+monetarium
 cmd/addblock/addblock
 cmd/findcheckpoint/findcheckpoint
 cmd/gencerts/gencerts
@@ -55,3 +57,10 @@ cmd/promptsecret/promptsecret
 # Vim
 *.sw*
 Session.vim
+
+# Runtime
+testdata
+testlogs
+
+# Metadata
+STRUCTURE.md

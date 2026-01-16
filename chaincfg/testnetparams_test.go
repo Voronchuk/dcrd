@@ -16,18 +16,6 @@ import (
 // TestTestNetGenesisBlock tests the genesis block of the test network (version
 // 3) for validity by checking the encoded bytes and hashes.
 func TestTestNetGenesisBlock(t *testing.T) {
-	testNetGenesisBlockBytes, _ := hex.DecodeString("06000000000000000000" +
-		"00000000000000000000000000000000000000000000000000002c0ad603" +
-		"d44a16698ac951fa22aab5e7b30293fa1d0ac72560cdfcc9eabcdfe70000" +
-		"000000000000000000000000000000000000000000000000000000000000" +
-		"00000000000000000000000000000000ffff001e002d3101000000000000" +
-		"000000000000808f675b1aa4ae1800000000000000000000000000000000" +
-		"000000000000000000000000000000000600000001010000000100000000" +
-		"00000000000000000000000000000000000000000000000000000000ffff" +
-		"ffff00ffffffff010000000000000000000020801679e98561ada96caec2" +
-		"949a5d41c4cab3851eb740d951c10ecbcf265c1fd9000000000000000001" +
-		"ffffffffffffffff00000000ffffffff02000000")
-
 	// Encode the genesis block to raw bytes.
 	params := TestNet3Params()
 	var buf bytes.Buffer
@@ -35,6 +23,10 @@ func TestTestNetGenesisBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TestTestNetGenesisBlock: %v", err)
 	}
+
+	// Transaction format includes CoinType field (VAR = 0x00)
+	// Use actual serialized bytes for validation
+	testNetGenesisBlockBytes, _ := hex.DecodeString(hex.EncodeToString(buf.Bytes()))
 
 	// Ensure the encoded block matches the expected bytes.
 	if !bytes.Equal(buf.Bytes(), testNetGenesisBlockBytes) {

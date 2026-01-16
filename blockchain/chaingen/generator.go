@@ -14,8 +14,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/decred/dcrd/blockchain/stake/v5"
+	"github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/crypto/rand"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4"
@@ -429,7 +432,7 @@ func (g *Generator) calcFullSubsidy(blockHeight uint32) dcrutil.Amount {
 // same code to generate them.
 func (g *Generator) calcPoWSubsidy(fullSubsidy dcrutil.Amount, blockHeight uint32, numVotes uint16) dcrutil.Amount {
 	const (
-		powProportion    = 6
+		powProportion    = 5
 		totalProportions = 10
 	)
 	powSubsidy := (fullSubsidy * powProportion) / totalProportions
@@ -455,7 +458,7 @@ func (g *Generator) calcPoSSubsidy(heightVotedOn uint32) dcrutil.Amount {
 	}
 
 	const (
-		posProportion    = 3
+		posProportion    = 5
 		totalProportions = 10
 	)
 	fullSubsidy := g.calcFullSubsidy(heightVotedOn)
@@ -470,7 +473,7 @@ func (g *Generator) calcPoSSubsidy(heightVotedOn uint32) dcrutil.Amount {
 // same code to generate them.
 func (g *Generator) calcDevSubsidy(fullSubsidy dcrutil.Amount, blockHeight uint32, numVotes uint16) dcrutil.Amount {
 	const (
-		devProportion    = 1
+		devProportion    = 0
 		totalProportions = 10
 	)
 	devSubsidy := (fullSubsidy * devProportion) / totalProportions
@@ -507,6 +510,7 @@ func standardCoinbaseOpReturnScript(blockHeight uint32) []byte {
 func newTxOut(amount int64, pkScriptVer uint16, pkScript []byte) *wire.TxOut {
 	return &wire.TxOut{
 		Value:    amount,
+		CoinType: cointype.CoinTypeVAR,
 		Version:  pkScriptVer,
 		PkScript: pkScript,
 	}
@@ -522,6 +526,7 @@ func (g *Generator) addCoinbaseTxOutputs(tx *wire.MsgTx, blockHeight uint32, dev
 	// First output is the developer subsidy.
 	tx.AddTxOut(&wire.TxOut{
 		Value:    int64(devSubsidy),
+		CoinType: cointype.CoinTypeVAR,
 		Version:  g.params.OrganizationPkScriptVersion,
 		PkScript: g.params.OrganizationPkScript,
 	})
@@ -886,6 +891,16 @@ func (g *Generator) CreateVoteTx(voteBlock *wire.MsgBlock, ticketTx *wire.MsgTx,
 	tx.AddTxOut(wire.NewTxOut(0, blockScript))
 	tx.AddTxOut(wire.NewTxOut(0, voteScript))
 	tx.AddTxOut(newTxOut(int64(voteSubsidy+ticketPrice), genScriptVer, genScript))
+
+	// Add consolidation address output (required for SSFee distribution)
+	// Use the p2sh script hash160 for test consistency
+	hash160 := stdaddr.Hash160(g.p2shOpTrueScript)
+	consolidationOut, err := stake.CreateSSFeeConsolidationOutput(hash160)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create consolidation output: %v", err))
+	}
+	tx.AddTxOut(consolidationOut)
+
 	return tx
 }
 
@@ -894,6 +909,107 @@ func (g *Generator) CreateVoteTx(voteBlock *wire.MsgBlock, ticketTx *wire.MsgTx,
 // original commitments. It requires a stake ticket as a parameter.
 func (g *Generator) createVoteTxFromTicket(voteBlock *wire.MsgBlock, ticket *stakeTicket) *wire.MsgTx {
 	return g.CreateVoteTx(voteBlock, ticket.tx, ticket.blockHeight, ticket.blockIndex)
+}
+
+// createStakerSSFeeTxns creates staker SSFee transactions for test blocks.
+// For simplicity, creates one SSFee per voter (not batched by consolidation address).
+// In production, these would be batched, but for tests we keep it simple.
+//
+// This function handles UTXO augmentation: if an existing SSFee output exists for
+// a voter's consolidation address, it will be used as input and augmented with the
+// new fee. Otherwise, a null-input SSFee is created.
+func (g *Generator) createStakerSSFeeTxns(coinType cointype.CoinType, totalFee dcrutil.Amount,
+	votes []*wire.MsgTx, nextHeight uint32) []*wire.MsgTx {
+
+	if len(votes) == 0 || totalFee == 0 {
+		return nil
+	}
+
+	// Group votes by consolidation address
+	// Key: hex-encoded hash160, Value: list of voter indices
+	addrGroups := make(map[string][]int)
+	addrScripts := make(map[string][]byte)
+
+	for voterSeq, voteTx := range votes {
+		hash160, err := stake.ExtractSSFeeConsolidationAddr(voteTx)
+		if err != nil {
+			panic(fmt.Sprintf("vote missing consolidation address: %v", err))
+		}
+
+		hash160Hex := fmt.Sprintf("%x", hash160)
+		addrGroups[hash160Hex] = append(addrGroups[hash160Hex], voterSeq)
+
+		if _, exists := addrScripts[hash160Hex]; !exists {
+			recipientScript, err := stake.ConsolidationAddrToPkScript(hash160)
+			if err != nil {
+				panic(fmt.Sprintf("failed to create pkScript: %v", err))
+			}
+			addrScripts[hash160Hex] = recipientScript
+		}
+	}
+
+	// Calculate fee per voter
+	feePerVoter := totalFee / dcrutil.Amount(len(votes))
+	remainder := totalFee - (feePerVoter * dcrutil.Amount(len(votes)))
+
+	// Sort group keys for deterministic remainder assignment
+	sortedKeys := make([]string, 0, len(addrGroups))
+	for key := range addrGroups {
+		sortedKeys = append(sortedKeys, key)
+	}
+	sort.Strings(sortedKeys)
+
+	// Create one SSFee transaction per consolidation address (batching)
+	ssfeeTxns := make([]*wire.MsgTx, 0, len(addrGroups))
+
+	for i, hash160Hex := range sortedKeys {
+		voterIndices := addrGroups[hash160Hex]
+		// Calculate total fee for this group
+		groupFee := feePerVoter * dcrutil.Amount(len(voterIndices))
+		// First sorted group gets remainder for deterministic results
+		if i == 0 && remainder > 0 {
+			groupFee += remainder
+		}
+
+		if groupFee == 0 {
+			continue // Skip zero-amount transactions
+		}
+
+		tx := wire.NewMsgTx()
+		tx.Version = 3
+
+		// Null input
+		tx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: *wire.NewOutPoint(&chainhash.Hash{},
+				wire.MaxPrevOutIndex, wire.TxTreeRegular),
+			Sequence:        wire.MaxTxInSequenceNum,
+			BlockHeight:     wire.NullBlockHeight,
+			BlockIndex:      wire.NullBlockIndex,
+			ValueIn:         int64(groupFee),
+			SignatureScript: []byte{},
+		})
+
+		// Payment output
+		tx.AddTxOut(&wire.TxOut{
+			Value:    int64(groupFee),
+			CoinType: coinType,
+			Version:  0,
+			PkScript: addrScripts[hash160Hex],
+		})
+
+		// SSFee marker (use first voter's sequence for uniqueness)
+		markerScript := stake.CreateStakerSSFeeMarker(int64(nextHeight), uint16(voterIndices[0]))
+		tx.AddTxOut(&wire.TxOut{
+			Value:    0,
+			CoinType: coinType,
+			Version:  0,
+			PkScript: markerScript,
+		})
+
+		ssfeeTxns = append(ssfeeTxns, tx)
+	}
+
+	return ssfeeTxns
 }
 
 // CreateRevocationTx returns a new transaction (ssrtx) refunding the ticket
@@ -1969,21 +2085,38 @@ func (g *Generator) ReplaceWithNVotes(numVotes uint16) func(*wire.MsgBlock) {
 
 		// Generate vote transactions for the winning tickets.
 		defaultNumVotes := int(g.params.TicketsPerBlock)
-		numExisting := len(b.STransactions) - defaultNumVotes
-		stakeTxns := make([]*wire.MsgTx, 0, numExisting+int(numVotes))
+		stakeTxns := make([]*wire.MsgTx, 0, int(numVotes))
 		for _, ticket := range winners {
 			voteTx := g.createVoteTxFromTicket(parentBlock, ticket)
 			stakeTxns = append(stakeTxns, voteTx)
 		}
 
-		// Add back the original stake transactions other than the
-		// original stake votes that have been replaced.
-		stakeTxns = append(stakeTxns, b.STransactions[defaultNumVotes:]...)
+		// Add back the original stake transactions other than votes and SSFees.
+		// SSFees need to be regenerated with the correct fee scaling.
+		for i := defaultNumVotes; i < len(b.STransactions); i++ {
+			stx := b.STransactions[i]
+			if stake.DetermineTxType(stx) != stake.TxTypeSSFee {
+				stakeTxns = append(stakeTxns, stx)
+			}
+		}
 
 		// Update the block with the new stake transactions and the
 		// header with the new number of votes.
 		b.STransactions = stakeTxns
 		b.Header.Voters = numVotes
+
+		// Calculate total fees from regular transactions (skip coinbase).
+		var totalFees dcrutil.Amount
+		for _, tx := range b.Transactions[1:] {
+			var inputSum, outputSum dcrutil.Amount
+			for _, txIn := range tx.TxIn {
+				inputSum += dcrutil.Amount(txIn.ValueIn)
+			}
+			for _, txOut := range tx.TxOut {
+				outputSum += dcrutil.Amount(txOut.Value)
+			}
+			totalFees += (inputSum - outputSum)
+		}
 
 		// Recalculate the coinbase amount based on the number of new
 		// votes and update the coinbase so that the adjustment in
@@ -1992,10 +2125,32 @@ func (g *Generator) ReplaceWithNVotes(numVotes uint16) func(*wire.MsgBlock) {
 		fullSubsidy := g.calcFullSubsidy(height)
 		devSubsidy := g.calcDevSubsidy(fullSubsidy, height, numVotes)
 		powSubsidy := g.calcPoWSubsidy(fullSubsidy, height, numVotes)
+
+		// Scale fees by voter participation and calculate fee split
+		var minerShareOfTotalFees dcrutil.Amount
+		if int64(height) >= g.params.StakeValidationHeight && numVotes > 0 {
+			scaledTotalFees := int64(totalFees) * int64(numVotes) / int64(g.params.TicketsPerBlock)
+			minerFeesTotal, stakerFeesTotal := standalone.CalcFeeSplit(scaledTotalFees, standalone.SSVMonetarium)
+			minerShareOfTotalFees = dcrutil.Amount(minerFeesTotal)
+
+			// Regenerate SSFee transactions with correct scaled fees
+			if stakerFeesTotal > 0 {
+				voteTransactions := make([]*wire.MsgTx, numVotes)
+				for i := uint16(0); i < numVotes; i++ {
+					voteTransactions[i] = stakeTxns[i]
+				}
+				ssfeeVAR := g.createStakerSSFeeTxns(cointype.CoinTypeVAR, dcrutil.Amount(stakerFeesTotal), voteTransactions, height)
+				b.STransactions = append(b.STransactions, ssfeeVAR...)
+			}
+		}
+
 		cbTx := b.Transactions[0]
+		// Coinbase input value is subsidy only (without fees)
 		cbTx.TxIn[0].ValueIn = int64(devSubsidy + powSubsidy)
 		cbTx.TxOut = nil
 		g.addCoinbaseTxOutputs(cbTx, height, devSubsidy, powSubsidy)
+		// Add miner fee share to pow output (fees come from regular tx inputs)
+		cbTx.TxOut[2].Value += int64(minerShareOfTotalFees)
 	}
 }
 
@@ -2568,9 +2723,9 @@ func updateVoteCommitments(block *wire.MsgBlock) {
 //
 // 1. A coinbase with the following outputs:
 //
-//   - One that pays the required 10% subsidy to the dev org
+//   - One that pays the required 0% subsidy to the dev org
 //   - One that contains a standard coinbase OP_RETURN script
-//   - Six that pay the required 60% subsidy to an OP_TRUE p2sh script
+//   - Six that pay the required 50% subsidy to an OP_TRUE p2sh script
 //
 // 2. When a spendable output is provided:
 //
@@ -2698,22 +2853,19 @@ func (g *Generator) NextBlock(blockName string, spend *SpendableOut, ticketSpend
 
 	// Create a standard coinbase and spending transaction.
 	var regularTxns []*wire.MsgTx
+	// Total fees include both stake tree and regular tree fees
+	totalFees := stakeTreeFees
+
 	{
 		// Create coinbase transaction for the block with no additional
 		// dev or pow subsidy.
 		coinbaseTx := g.CreateCoinbaseTx(nextHeight, numVotes)
 		regularTxns = []*wire.MsgTx{coinbaseTx}
 
-		// Increase the PoW subsidy to account for any fees in the stake
-		// tree.
-		coinbaseTx.TxOut[2].Value += int64(stakeTreeFees)
-
 		// Create a transaction to spend the provided utxo if needed.
 		if spend != nil {
-			// Create the transaction with a fee of 1 atom for the
-			// miner and increase the PoW subsidy accordingly.
-			fee := dcrutil.Amount(1)
-			coinbaseTx.TxOut[2].Value += int64(fee)
+			// Create the transaction with a fee of 2 atoms.
+			fee := dcrutil.Amount(2)
 
 			// Create a transaction that spends from the provided
 			// spendable output and includes an additional unique
@@ -2725,6 +2877,52 @@ func (g *Generator) NextBlock(blockName string, spend *SpendableOut, ticketSpend
 			// tests.
 			spendTx := g.CreateSpendTx(spend, fee)
 			regularTxns = append(regularTxns, spendTx)
+
+			// Add regular transaction fee to total
+			totalFees += fee
+		}
+
+		// NOW distribute total fees (after all fees are accounted for)
+		var minerShareOfTotalFees dcrutil.Amount
+		if int64(nextHeight) < g.params.StakeValidationHeight {
+			// Before stake validation, miners get 100% of fees since there are no active stakers
+			minerShareOfTotalFees = totalFees
+		} else {
+			// Scale fees by voter participation (same as validator does)
+			// This matches validate.go lines 5157-5161
+			scaledTotalFees := int64(totalFees) * int64(numVotes) / int64(g.params.TicketsPerBlock)
+
+			// After stake validation, use the exact CalcFeeSplit function from standalone package
+			// This ensures perfect alignment with validator expectations using SSVMonetarium
+			minerFeesTotal, _ := standalone.CalcFeeSplit(scaledTotalFees, standalone.SSVMonetarium)
+			minerShareOfTotalFees = dcrutil.Amount(minerFeesTotal)
+		}
+		coinbaseTx.TxOut[2].Value += int64(minerShareOfTotalFees)
+
+		// Create SSFee transactions to distribute staker fees after stake validation height
+		if int64(nextHeight) >= g.params.StakeValidationHeight && numVotes > 0 {
+			// Scale fees by voter participation (same as validator does)
+			scaledTotalFees := int64(totalFees) * int64(numVotes) / int64(g.params.TicketsPerBlock)
+
+			// Calculate staker share
+			_, stakerFeesTotal := standalone.CalcFeeSplit(scaledTotalFees, standalone.SSVMonetarium)
+			stakerFee := dcrutil.Amount(stakerFeesTotal)
+
+			if stakerFee > 0 {
+				// Create SSFee transactions for VAR coin type
+				// For tests, we distribute to each voter (simplified batching)
+				// Only use votes created in this block (first numVotes transactions in stakeTxns)
+				voteTransactions := make([]*wire.MsgTx, numVotes)
+				for i := uint16(0); i < numVotes; i++ {
+					voteTransactions[i] = stakeTxns[i]
+				}
+
+				ssfeeVAR := g.createStakerSSFeeTxns(cointype.CoinTypeVAR, stakerFee, voteTransactions, nextHeight)
+				stakeTxns = append(stakeTxns, ssfeeVAR...)
+
+				// Note: Miner SSFee for VAR goes to coinbase (already added above)
+				// Miner SSFee for SKA would be created here but tests don't have SKA fees yet
+			}
 		}
 	}
 
@@ -2793,6 +2991,91 @@ func (g *Generator) NextBlock(blockName string, spend *SpendableOut, ticketSpend
 			updateVoteCommitments(&block)
 		}
 	}
+
+	// Recalculate SSFee transactions after mungers if we're at stake validation height.
+	// Mungers may have added transactions with fees that weren't accounted for.
+	if int64(nextHeight) >= g.params.StakeValidationHeight && numVotes > 0 {
+		// Calculate actual total fees from all transactions
+		actualTotalFees := dcrutil.Amount(0)
+
+		// Regular tree fees (skip coinbase)
+		for _, tx := range block.Transactions[1:] {
+			var txIn, txOut int64
+			for _, in := range tx.TxIn {
+				txIn += in.ValueIn
+			}
+			for _, out := range tx.TxOut {
+				txOut += out.Value
+			}
+			if txIn > txOut {
+				actualTotalFees += dcrutil.Amount(txIn - txOut)
+			}
+		}
+
+		// Stake tree fees (skip votes and SSFee)
+		for _, stx := range block.STransactions {
+			txType := stake.DetermineTxType(stx)
+			if txType == stake.TxTypeSSGen || txType == stake.TxTypeSSFee {
+				continue
+			}
+			var txIn, txOut int64
+			for _, in := range stx.TxIn {
+				txIn += in.ValueIn
+			}
+			for _, out := range stx.TxOut {
+				txOut += out.Value
+			}
+			if txIn > txOut {
+				actualTotalFees += dcrutil.Amount(txIn - txOut)
+			}
+		}
+
+		// Scale fees by voter participation
+		scaledActualFees := int64(actualTotalFees) * int64(numVotes) / int64(g.params.TicketsPerBlock)
+
+		// Calculate expected miner and staker shares
+		actualMinerShare, actualStakerShare := standalone.CalcFeeSplit(scaledActualFees, standalone.SSVMonetarium)
+
+		// Get the current miner fee (from pow output minus base subsidy)
+		// Use original totalFees scaled to get the expected miner share
+		originalScaledFees := int64(totalFees) * int64(numVotes) / int64(g.params.TicketsPerBlock)
+		originalMinerShare, _ := standalone.CalcFeeSplit(originalScaledFees, standalone.SSVMonetarium)
+
+		// Only update if the miner fee changed due to additional transactions
+		if actualMinerShare != originalMinerShare {
+			// Calculate the fee difference to add
+			feeDiff := actualMinerShare - originalMinerShare
+
+			// Update coinbase pow output by adding only the fee difference
+			block.Transactions[0].TxOut[2].Value += feeDiff
+
+			// Remove old SSFee transactions from stake tree
+			var newStakeTxns []*wire.MsgTx
+			for _, stx := range block.STransactions {
+				if stake.DetermineTxType(stx) != stake.TxTypeSSFee {
+					newStakeTxns = append(newStakeTxns, stx)
+				}
+			}
+
+			// Regenerate SSFee transactions if staker share is positive
+			if actualStakerShare > 0 {
+				// Get vote transactions by type (not by index)
+				var voteTransactions []*wire.MsgTx
+				for _, stx := range newStakeTxns {
+					if stake.DetermineTxType(stx) == stake.TxTypeSSGen {
+						voteTransactions = append(voteTransactions, stx)
+					}
+				}
+				if len(voteTransactions) > 0 {
+					ssfeeVAR := g.createStakerSSFeeTxns(cointype.CoinTypeVAR, dcrutil.Amount(actualStakerShare), voteTransactions, nextHeight)
+					newStakeTxns = append(newStakeTxns, ssfeeVAR...)
+				}
+			}
+
+			block.STransactions = newStakeTxns
+		}
+	}
+
 	if block.Header.MerkleRoot == curMerkleRoot {
 		block.Header.MerkleRoot = calcMerkleRoot(block.Transactions)
 	}
@@ -2859,19 +3142,39 @@ func (g *Generator) CreateBlockOne(blockName string, additionalAmount dcrutil.Am
 		SignatureScript: coinbaseSigScript,
 	})
 
-	// Add each required output and tally the total payouts for the coinbase
-	// in order to set the input value appropriately.
-	var totalSubsidy dcrutil.Amount
-	for _, payout := range g.params.BlockOneLedger {
-		coinbaseTx.AddTxOut(&wire.TxOut{
-			Value:    payout.Amount + int64(additionalAmount),
-			Version:  payout.ScriptVersion,
-			PkScript: payout.Script,
-		})
+	// Handle block one coinbase based on whether there's a premine.
+	if len(g.params.BlockOneLedger) == 0 {
+		// No premine - create coinbase with 0 subsidy.
+		// Block one with no BlockOneLedger has 0 subsidy per consensus rules.
+		// We still need at least one output for CheckTransactionSanity,
+		// so add an OP_RETURN output with 0 value.
+		const blockHeight = 1
+		coinbaseTx.AddTxOut(wire.NewTxOut(0, standardCoinbaseOpReturnScript(blockHeight)))
 
-		totalSubsidy += dcrutil.Amount(payout.Amount)
+		// Add the additional amount for testing invalid blocks.
+		// This makes the coinbase invalid by having non-zero value output
+		// which exceeds the expected 0 subsidy (ErrBadCoinbaseValue).
+		// Note: ValueIn stays 0 to pass the input check; the output check
+		// will fail because totalAtomOutRegular > expAtomOut (0).
+		if additionalAmount != 0 {
+			coinbaseTx.AddTxOut(newTxOut(int64(additionalAmount), g.p2shOpTrueScriptVer, g.p2shOpTrueScript))
+		}
+	} else {
+		// Add each required output and tally the total payouts for the coinbase
+		// in order to set the input value appropriately.
+		var totalSubsidy dcrutil.Amount
+		for _, payout := range g.params.BlockOneLedger {
+			coinbaseTx.AddTxOut(&wire.TxOut{
+				Value:    payout.Amount + int64(additionalAmount),
+				CoinType: cointype.CoinTypeVAR,
+				Version:  payout.ScriptVersion,
+				PkScript: payout.Script,
+			})
+
+			totalSubsidy += dcrutil.Amount(payout.Amount)
+		}
+		coinbaseTx.TxIn[0].ValueIn = int64(totalSubsidy)
 	}
-	coinbaseTx.TxIn[0].ValueIn = int64(totalSubsidy)
 
 	// Generate the block with the specially created regular transactions.
 	munger := func(b *wire.MsgBlock) {

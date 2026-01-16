@@ -12,6 +12,7 @@ import (
 	"github.com/decred/dcrd/addrmgr/v3"
 	"github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/gcs/v4"
 	"github.com/decred/dcrd/internal/blockchain"
@@ -462,6 +463,22 @@ type Chain interface {
 	// proof of work hash function to blake3, as defined in DCP0011, has passed
 	// and is now active for the block AFTER the given block.
 	IsBlake3PowAgendaActive(*chainhash.Hash) (bool, error)
+
+	// GetSKAEmissionNonce returns the last used nonce for the specified coin type
+	// from the blockchain state. Returns 0 if no emissions have occurred yet.
+	GetSKAEmissionNonce(cointype.CoinType) uint64
+
+	// HasSKAEmissionOccurred returns whether the specified coin type has been
+	// emitted in the blockchain.
+	HasSKAEmissionOccurred(cointype.CoinType) bool
+
+	// GetSKABurnedAmount returns the total amount burned for the specified SKA
+	// coin type. Returns 0 if no burns have occurred for this coin type.
+	GetSKABurnedAmount(cointype.CoinType) int64
+
+	// GetAllSKABurnedAmounts returns a map of all SKA coin types to their total
+	// burned amounts. Only coin types with non-zero burned amounts are included.
+	GetAllSKABurnedAmounts() map[cointype.CoinType]int64
 }
 
 // Clock represents a clock for use with the RPC server. The purpose of this
@@ -488,6 +505,37 @@ type FeeEstimator interface {
 	// confirmed in at most `targetConfs` blocks after publishing with a
 	// high degree of certainty.
 	EstimateFee(targetConfs int32) (dcrutil.Amount, error)
+}
+
+// CoinTypeFeeCalculator provides an interface for coin-type-specific fee
+// estimation and management for the dual-coin system.
+//
+// The interface contract requires that all of these methods are safe for
+// concurrent access.
+type CoinTypeFeeCalculator interface {
+	// GetFeeStats returns comprehensive fee statistics for a specific coin type
+	// including dynamic multiplier, pending transaction data, and fee percentiles.
+	GetFeeStats(coinType cointype.CoinType) (*CoinTypeFeeStats, error)
+
+	// EstimateFeeRate returns the current fee rate estimate for the given coin type
+	// and target confirmation blocks.
+	EstimateFeeRate(coinType cointype.CoinType, targetConfirmations int) (dcrutil.Amount, error)
+}
+
+// CoinTypeFeeStats contains fee statistics for a specific coin type as used by
+// the RPC interface - this mirrors the fees package structure for compatibility.
+type CoinTypeFeeStats struct {
+	CoinType             cointype.CoinType
+	MinRelayFee          dcrutil.Amount
+	DynamicFeeMultiplier float64
+	MaxFeeRate           dcrutil.Amount
+	FastFee              dcrutil.Amount // ~1 block (90th percentile)
+	NormalFee            dcrutil.Amount // ~3 blocks (50th percentile)
+	SlowFee              dcrutil.Amount // ~6 blocks (10th percentile)
+	PendingTxCount       int
+	PendingTxSize        int64
+	BlockSpaceUsed       float64
+	LastUpdated          time.Time
 }
 
 // LogManager represents a log manager for use with the RPC server.

@@ -123,7 +123,7 @@ type TransactionInput struct {
 // CreateRawTransactionCmd defines the createrawtransaction JSON-RPC command.
 type CreateRawTransactionCmd struct {
 	Inputs   []TransactionInput
-	Amounts  map[string]float64 `jsonrpcusage:"{\"address\":amount,...}"` // In DCR
+	Amounts  map[string]float64 `jsonrpcusage:"{\"address\":amount,...}"` // In VAR
 	LockTime *int64
 	Expiry   *int64
 }
@@ -131,7 +131,7 @@ type CreateRawTransactionCmd struct {
 // NewCreateRawTransactionCmd returns a new instance which can be used to issue
 // a createrawtransaction JSON-RPC command.
 //
-// Amounts are in DCR.
+// Amounts are in VAR.
 func NewCreateRawTransactionCmd(inputs []TransactionInput, amounts map[string]float64,
 	lockTime *int64, expiry *int64) *CreateRawTransactionCmd {
 
@@ -216,6 +216,7 @@ const (
 type EstimateSmartFeeCmd struct {
 	Confirmations int64
 	Mode          *EstimateSmartFeeMode `jsonrpcdefault:"\"conservative\""`
+	CoinType      *uint8                // Optional: if nil, defaults to VAR (0)
 }
 
 // NewEstimateSmartFeeCmd returns a new instance which can be used to issue an
@@ -224,6 +225,46 @@ func NewEstimateSmartFeeCmd(confirmations int64, mode *EstimateSmartFeeMode) *Es
 	return &EstimateSmartFeeCmd{
 		Confirmations: confirmations,
 		Mode:          mode,
+		CoinType:      nil, // Default to VAR
+	}
+}
+
+// NewEstimateSmartFeeCmdWithCoinType returns a new instance with coin type specified.
+func NewEstimateSmartFeeCmdWithCoinType(confirmations int64, mode *EstimateSmartFeeMode, coinType *uint8) *EstimateSmartFeeCmd {
+	return &EstimateSmartFeeCmd{
+		Confirmations: confirmations,
+		Mode:          mode,
+		CoinType:      coinType,
+	}
+}
+
+// GetFeeEstimatesByCoinTypeCmd defines the getfeestimatesbycointype JSON-RPC command.
+type GetFeeEstimatesByCoinTypeCmd struct {
+	CoinType      uint8                 `json:"cointype"`
+	Confirmations *int64                `jsonrpcdefault:"1"`
+	Mode          *EstimateSmartFeeMode `jsonrpcdefault:"\"conservative\""`
+}
+
+// NewGetFeeEstimatesByCoinTypeCmd returns a new instance which can be used to issue a
+// getfeestimatesbycointype JSON-RPC command.
+func NewGetFeeEstimatesByCoinTypeCmd(coinType uint8, confirmations *int64, mode *EstimateSmartFeeMode) *GetFeeEstimatesByCoinTypeCmd {
+	return &GetFeeEstimatesByCoinTypeCmd{
+		CoinType:      coinType,
+		Confirmations: confirmations,
+		Mode:          mode,
+	}
+}
+
+// GetMempoolFeesInfoCmd defines the getmempoolfeesinfo JSON-RPC command.
+type GetMempoolFeesInfoCmd struct {
+	CoinType *uint8 `jsonrpcdefault:"null"` // Optional: if null, returns info for all coin types
+}
+
+// NewGetMempoolFeesInfoCmd returns a new instance which can be used to issue a
+// getmempoolfeesinfo JSON-RPC command.
+func NewGetMempoolFeesInfoCmd(coinType *uint8) *GetMempoolFeesInfoCmd {
+	return &GetMempoolFeesInfoCmd{
+		CoinType: coinType,
 	}
 }
 
@@ -517,6 +558,28 @@ type GetInfoCmd struct{}
 // getinfo JSON-RPC command.
 func NewGetInfoCmd() *GetInfoCmd {
 	return &GetInfoCmd{}
+}
+
+// GetSKAInfoCmd defines the getskainfo JSON-RPC command.
+type GetSKAInfoCmd struct{}
+
+// NewGetSKAInfoCmd returns a new instance which can be used to issue a
+// getskainfo JSON-RPC command.
+func NewGetSKAInfoCmd() *GetSKAInfoCmd {
+	return &GetSKAInfoCmd{}
+}
+
+// GetEmissionStatusCmd defines the getemissionstatus JSON-RPC command.
+type GetEmissionStatusCmd struct {
+	CoinType uint8 `json:"cointype"`
+}
+
+// NewGetEmissionStatusCmd returns a new instance which can be used to issue a
+// getemissionstatus JSON-RPC command.
+func NewGetEmissionStatusCmd(coinType uint8) *GetEmissionStatusCmd {
+	return &GetEmissionStatusCmd{
+		CoinType: coinType,
+	}
 }
 
 // GetHeadersCmd defines the getheaders JSON-RPC command.
@@ -1142,6 +1205,19 @@ type VersionCmd struct{}
 // version command.
 func NewVersionCmd() *VersionCmd { return new(VersionCmd) }
 
+// GetBurnedCoinsCmd defines the getburnedcoins JSON-RPC command.
+type GetBurnedCoinsCmd struct {
+	CoinType *uint8 `jsonrpcdefault:"null"` // Optional: if null, returns all coin types
+}
+
+// NewGetBurnedCoinsCmd returns a new instance which can be used to issue a
+// getburnedcoins JSON-RPC command.
+func NewGetBurnedCoinsCmd(coinType *uint8) *GetBurnedCoinsCmd {
+	return &GetBurnedCoinsCmd{
+		CoinType: coinType,
+	}
+}
+
 func init() {
 	// No special flags for commands in this file.
 	flags := dcrjson.UsageFlag(0)
@@ -1155,6 +1231,8 @@ func init() {
 	dcrjson.MustRegister(Method("decodescript"), (*DecodeScriptCmd)(nil), flags)
 	dcrjson.MustRegister(Method("estimatefee"), (*EstimateFeeCmd)(nil), flags)
 	dcrjson.MustRegister(Method("estimatesmartfee"), (*EstimateSmartFeeCmd)(nil), flags)
+	dcrjson.MustRegister(Method("getfeestimatesbycointype"), (*GetFeeEstimatesByCoinTypeCmd)(nil), flags)
+	dcrjson.MustRegister(Method("getmempoolfeesinfo"), (*GetMempoolFeesInfoCmd)(nil), flags)
 	dcrjson.MustRegister(Method("estimatestakediff"), (*EstimateStakeDiffCmd)(nil), flags)
 	dcrjson.MustRegister(Method("existsaddress"), (*ExistsAddressCmd)(nil), flags)
 	dcrjson.MustRegister(Method("existsaddresses"), (*ExistsAddressesCmd)(nil), flags)
@@ -1181,6 +1259,8 @@ func init() {
 	dcrjson.MustRegister(Method("gethashespersec"), (*GetHashesPerSecCmd)(nil), flags)
 	dcrjson.MustRegister(Method("getheaders"), (*GetHeadersCmd)(nil), flags)
 	dcrjson.MustRegister(Method("getinfo"), (*GetInfoCmd)(nil), flags)
+	dcrjson.MustRegister(Method("getskainfo"), (*GetSKAInfoCmd)(nil), flags)
+	dcrjson.MustRegister(Method("getemissionstatus"), (*GetEmissionStatusCmd)(nil), flags)
 	dcrjson.MustRegister(Method("getmempoolinfo"), (*GetMempoolInfoCmd)(nil), flags)
 	dcrjson.MustRegister(Method("getmininginfo"), (*GetMiningInfoCmd)(nil), flags)
 	dcrjson.MustRegister(Method("getmixmessage"), (*GetMixMessageCmd)(nil), flags)
@@ -1223,4 +1303,5 @@ func init() {
 	dcrjson.MustRegister(Method("verifychain"), (*VerifyChainCmd)(nil), flags)
 	dcrjson.MustRegister(Method("verifymessage"), (*VerifyMessageCmd)(nil), flags)
 	dcrjson.MustRegister(Method("version"), (*VersionCmd)(nil), flags)
+	dcrjson.MustRegister(Method("getburnedcoins"), (*GetBurnedCoinsCmd)(nil), flags)
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrec"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrutil/v4"
@@ -394,19 +395,16 @@ func (p *poolHarness) AddFakeUTXO(tx *dcrutil.Tx, blockHeight int64, blockIndex 
 // determineSubsidySplitVariant returns the subsidy split variant to use based
 // on the agendas that are active on the harness.
 func (p *poolHarness) determineSubsidySplitVariant() standalone.SubsidySplitVariant {
-	switch {
-	case p.subsidySplitR2Active:
-		return standalone.SSVDCP0012
-	case p.subsidySplitActive:
-		return standalone.SSVDCP0010
-	}
-	return standalone.SSVOriginal
+	// Always use Monetarium subsidy split to match validation code
+	// The blockchain validation always uses SSVMonetarium regardless of agenda status
+	return standalone.SSVMonetarium
 }
 
 // newTxOut returns a new transaction output with the given parameters.
 func newTxOut(amount int64, pkScriptVer uint16, pkScript []byte) *wire.TxOut {
 	return &wire.TxOut{
 		Value:    amount,
+		CoinType: cointype.CoinTypeVAR,
 		Version:  pkScriptVer,
 		PkScript: pkScript,
 	}
@@ -685,6 +683,15 @@ func (p *poolHarness) CreateVote(ticket *dcrutil.Tx, mungers ...func(*wire.MsgTx
 		vote.AddTxOut(newTxOut(voteRewardValues[i], scriptVer, script))
 	}
 
+	// Add consolidation address output (required for SSFee distribution)
+	// Use the payment script's hash160 for the consolidation address
+	hash160 := stdaddr.Hash160(p.payScript)
+	consolidationOut, err := stake.CreateSSFeeConsolidationOutput(hash160)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create consolidation output: %w", err)
+	}
+	vote.AddTxOut(consolidationOut)
+
 	// Perform any transaction munging just before signing.
 	for _, f := range mungers {
 		f(vote)
@@ -871,10 +878,17 @@ func newPoolHarness(chainParams *chaincfg.Params) (*poolHarness, []spendableOutp
 	// coinbase will mature in the next block.  This ensures the txpool
 	// accepts transactions which spend immature coinbases that will become
 	// mature in the next block.
+	//
+	// Note: Use height 2+ to ensure there's a subsidy (height 0 and 1 have
+	// 0 subsidy since there's no premine in Monetarium).
 	numOutputs := uint32(1)
 	outputs := make([]spendableOutput, 0, numOutputs)
 	curHeight := harness.chain.BestHeight()
-	coinbase, err := harness.CreateCoinbaseTx(curHeight+1, numOutputs)
+	coinbaseHeight := curHeight + 1
+	if coinbaseHeight < 2 {
+		coinbaseHeight = 2
+	}
+	coinbase, err := harness.CreateCoinbaseTx(coinbaseHeight, numOutputs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -947,7 +961,7 @@ func testPoolMembership(tc *testContext, tx *dcrutil.Tx, inOrphanPool, inTxPool 
 func TestSimpleOrphanChain(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1010,7 +1024,7 @@ func TestSimpleOrphanChain(t *testing.T) {
 func TestTicketPurchaseOrphan(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1085,7 +1099,7 @@ func TestTicketPurchaseOrphan(t *testing.T) {
 func TestVoteOrphan(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1115,7 +1129,7 @@ func TestVoteOrphan(t *testing.T) {
 	// Ensure the vote is rejected because it is an orphan.
 	_, err = harness.txPool.ProcessTransaction(vote, false, true, 0)
 	if !errors.Is(err, ErrOrphan) {
-		t.Fatalf("Process Transaction: did not get expected ErrOrphan")
+		t.Fatalf("Process Transaction: did not get expected ErrOrphan, got: %v", err)
 	}
 	testPoolMembership(tc, vote, false, false)
 
@@ -1156,7 +1170,7 @@ func TestVoteOrphan(t *testing.T) {
 func TestRevocationOrphan(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1228,7 +1242,7 @@ func TestRevocationOrphan(t *testing.T) {
 func TestOrphanReject(t *testing.T) {
 	t.Parallel()
 
-	harness, outputs, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, outputs, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1274,7 +1288,7 @@ func TestOrphanReject(t *testing.T) {
 func TestOrphanEviction(t *testing.T) {
 	t.Parallel()
 
-	harness, outputs, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, outputs, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1335,7 +1349,7 @@ func TestOrphanEviction(t *testing.T) {
 // TestExpirationPruning ensures that transactions that expire without being
 // mined are removed.
 func TestExpirationPruning(t *testing.T) {
-	harness, outputs, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, outputs, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1419,7 +1433,7 @@ func TestBasicOrphanRemoval(t *testing.T) {
 	t.Parallel()
 
 	const maxOrphans = 4
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1496,7 +1510,7 @@ func TestOrphanChainRemoval(t *testing.T) {
 	t.Parallel()
 
 	const maxOrphans = 10
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1559,7 +1573,7 @@ func TestMultiInputOrphanDoubleSpend(t *testing.T) {
 	t.Parallel()
 
 	const maxOrphans = 4
-	harness, outputs, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, outputs, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1819,7 +1833,7 @@ func TestSequenceLockAcceptance(t *testing.T) {
 		err:        nil,
 	}}
 
-	harness, _, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, _, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -1900,7 +1914,7 @@ func TestSequenceLockAcceptance(t *testing.T) {
 func TestMaxVoteDoubleSpendRejection(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2027,7 +2041,7 @@ func TestMaxVoteDoubleSpendRejection(t *testing.T) {
 func TestDuplicateVoteRejection(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2118,7 +2132,7 @@ func TestDuplicateVoteRejection(t *testing.T) {
 func TestDuplicateTxError(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2177,7 +2191,7 @@ func TestDuplicateTxError(t *testing.T) {
 func TestMempoolDoubleSpend(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2221,7 +2235,7 @@ func TestMempoolDoubleSpend(t *testing.T) {
 func TestFetchTransaction(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2274,7 +2288,7 @@ func TestFetchTransaction(t *testing.T) {
 func TestRemoveDoubleSpends(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2727,7 +2741,7 @@ func TestHandlesTAdds(t *testing.T) {
 func TestRejectTreasurybases(t *testing.T) {
 	t.Parallel()
 
-	harness, _, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, _, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2798,7 +2812,7 @@ func TestRejectTreasurybases(t *testing.T) {
 // that moves from the stage pool into the main pool is set to the height it
 // was initially added to the mempool, rather than the height it was unstaged.
 func TestStagedTransactionHeight(t *testing.T) {
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2873,7 +2887,7 @@ func TestExplicitVersionSemantics(t *testing.T) {
 	t.Parallel()
 
 	// Create a new harness that accepts non-standard transactions.
-	harness, outputs, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, outputs, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -2984,7 +2998,7 @@ func TestExplicitVersionSemantics(t *testing.T) {
 func TestRevocationsWithAutoRevocationsEnabled(t *testing.T) {
 	t.Parallel()
 
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -3131,7 +3145,7 @@ func TestFraudProofHandling(t *testing.T) {
 	}}
 
 	for _, test := range tests {
-		harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+		harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 		if err != nil {
 			t.Fatalf("%q: unable to create test pool: %v", test.name, err)
 		}
@@ -3216,17 +3230,14 @@ func TestFraudProofHandling(t *testing.T) {
 	}
 }
 
-// TestSubsidySplitSemantics ensures the mempool has the following semantics
-// in regards to the modified subsidy split agenda:
-//
-// - Accepts votes with the original subsidy when the agenda is NOT active
-// - Rejects votes with the original subsidy when the agenda is active
-// - Accepts votes with the modified subsidy when the agenda is active
-// - Rejects votes with the modified subsidy when the agenda is NOT active
+// TestSubsidySplitSemantics ensures the mempool correctly validates votes
+// using the Monetarium subsidy split (50/50 miners/stakers).
+// This test has been simplified since Monetarium always uses the same
+// subsidy split regardless of agenda status
 func TestSubsidySplitSemantics(t *testing.T) {
 	t.Parallel()
 
-	harness, outputs, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, outputs, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -3254,83 +3265,46 @@ func TestSubsidySplitSemantics(t *testing.T) {
 	harness.chain.utxos.AddTxOuts(ticket, harness.chain.BestHeight(), 0,
 		noTreasury)
 
-	// Create a vote that votes on a block at stake validation height using the
-	// proportions required when the modified subsidy split agenda is NOT active.
-	harness.subsidySplitActive = false
+	// Create a vote that votes on a block at stake validation height.
+	// Monetarium always uses the 50/50 subsidy split (SSVMonetarium).
 	hash := chainhash.Hash{0x5c, 0xa1, 0xab, 0x1e}
 	mockBlock := dcrutil.NewBlock(&wire.MsgBlock{})
 	harness.chain.SetBestHash(&hash)
 	harness.chain.SetHeight(harness.chainParams.StakeValidationHeight)
 	harness.chain.blocks[hash] = mockBlock
-	preDCP0010Vote, err := harness.CreateVote(ticket)
+	vote, err := harness.CreateVote(ticket)
 	if err != nil {
 		t.Fatalf("unable to create vote: %v", err)
 	}
 
-	// Create another vote that votes on a block at stake validation height
-	// using the proportions required when the modified subsidy split agenda is
-	// active.
-	harness.subsidySplitActive = true
-	postDCP0010Vote, err := harness.CreateVote(ticket)
+	// Attempt to add the vote with the Monetarium subsidy and ensure it is
+	// accepted. Also, ensure it is not in the orphan pool, is in the
+	// transaction pool, and is reported as available.
+	_, err = txPool.ProcessTransaction(vote, false, true, 0)
 	if err != nil {
-		t.Fatalf("unable to create vote: %v", err)
+		t.Fatalf("failed to accept valid vote with Monetarium subsidy: %v", err)
 	}
+	testPoolMembership(tc, vote, false, true)
 
-	// Attempt to add the vote with the modified subsidy when the agenda is NOT
-	// active and ensure it is rejected.  Also, ensure it is not in the orphan
-	// pool, not in the transaction pool, and not reported as available.
-	harness.subsidySplitActive = false
-	_, err = txPool.ProcessTransaction(postDCP0010Vote, false, true, 0)
-	if !errors.Is(err, blockchain.ErrBadStakebaseAmountIn) {
-		t.Fatal("did not get expected ErrBadStakebaseAmountIn error")
-	}
-	testPoolMembership(tc, postDCP0010Vote, false, false)
-
-	// Attempt to add the vote with the original subsidy when the agenda is NOT
-	// active and ensure it is accepted.  Also, ensure it is not in the orphan
-	// pool, is in the transaction pool, and is reported as available.
-	_, err = txPool.ProcessTransaction(preDCP0010Vote, false, true, 0)
+	// Verify the vote is in the pool with correct subsidy
+	voteHash := vote.Hash()
+	txFromPool, err := harness.txPool.FetchTransaction(voteHash)
 	if err != nil {
-		t.Fatalf("failed to accept valid vote %v", err)
+		t.Fatalf("failed to fetch vote from pool: %v", err)
 	}
-	testPoolMembership(tc, preDCP0010Vote, false, true)
-
-	// Remove the vote from the pool and ensure it is not in the orphan pool,
-	// not in the transaction pool, and not reported as available.
-	harness.txPool.RemoveTransaction(preDCP0010Vote, true)
-	testPoolMembership(tc, preDCP0010Vote, false, false)
-
-	// Attempt to add the vote with the original subsidy when the agenda is
-	// active and ensure it is rejected.  Also, ensure it is not in the orphan
-	// pool, not in the transaction pool, and not reported as available.
-	harness.subsidySplitActive = true
-	_, err = txPool.ProcessTransaction(preDCP0010Vote, false, true, 0)
-	if !errors.Is(err, blockchain.ErrBadStakebaseAmountIn) {
-		t.Fatal("did not get expected ErrBadStakebaseAmountIn error")
+	if txFromPool == nil {
+		t.Fatal("vote not found in pool")
 	}
-	testPoolMembership(tc, preDCP0010Vote, false, false)
-
-	// Attempt to add the vote with the modified subsidy when the agenda is
-	// active and ensure it is accepted.  Also, ensure it is not in the orphan
-	// pool, is in the transaction pool, and is reported as available.
-	_, err = txPool.ProcessTransaction(postDCP0010Vote, false, true, 0)
-	if err != nil {
-		t.Fatalf("failed to accept valid vote %v", err)
-	}
-	testPoolMembership(tc, postDCP0010Vote, false, true)
 }
 
-// TestSubsidySplitR2Semantics ensures the mempool has the following semantics
-// in regards to the modified subsidy split round 2 agenda:
-//
-// - Accepts votes with the original subsidy when the agenda is NOT active
-// - Rejects votes with the original subsidy when the agenda is active
-// - Accepts votes with the modified subsidy when the agenda is active
-// - Rejects votes with the modified subsidy when the agenda is NOT active
+// TestSubsidySplitR2Semantics ensures the mempool correctly validates votes
+// using the Monetarium subsidy split (50/50 miners/stakers).
+// This test has been simplified since Monetarium always uses the same
+// subsidy split regardless of agenda status
 func TestSubsidySplitR2Semantics(t *testing.T) {
 	t.Parallel()
 
-	harness, outputs, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, outputs, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create test pool: %v", err)
 	}
@@ -3358,71 +3332,36 @@ func TestSubsidySplitR2Semantics(t *testing.T) {
 	harness.chain.utxos.AddTxOuts(ticket, harness.chain.BestHeight(), 0,
 		noTreasury)
 
-	// Create a vote that votes on a block at stake validation height using the
-	// proportions required when the modified subsidy split round 2 agenda is
-	// NOT active.
-	harness.subsidySplitR2Active = false
+	// Create a vote that votes on a block at stake validation height.
+	// Monetarium always uses the 50/50 subsidy split (SSVMonetarium).
 	hash := chainhash.Hash{0x5c, 0xa1, 0xab, 0x1e}
 	mockBlock := dcrutil.NewBlock(&wire.MsgBlock{})
 	harness.chain.SetBestHash(&hash)
 	harness.chain.SetHeight(harness.chainParams.StakeValidationHeight)
 	harness.chain.blocks[hash] = mockBlock
-	preDCP0012Vote, err := harness.CreateVote(ticket)
+	vote, err := harness.CreateVote(ticket)
 	if err != nil {
 		t.Fatalf("unable to create vote: %v", err)
 	}
 
-	// Create another vote that votes on a block at stake validation height
-	// using the proportions required when the modified subsidy split round 2
-	// agenda is active.
-	harness.subsidySplitR2Active = true
-	postDCP0012Vote, err := harness.CreateVote(ticket)
+	// Attempt to add the vote with the Monetarium subsidy and ensure it is
+	// accepted. Also, ensure it is not in the orphan pool, is in the
+	// transaction pool, and is reported as available.
+	_, err = txPool.ProcessTransaction(vote, false, true, 0)
 	if err != nil {
-		t.Fatalf("unable to create vote: %v", err)
+		t.Fatalf("failed to accept valid vote with Monetarium subsidy: %v", err)
 	}
+	testPoolMembership(tc, vote, false, true)
 
-	// Attempt to add the vote with the modified subsidy when the agenda is NOT
-	// active and ensure it is rejected.  Also, ensure it is not in the orphan
-	// pool, not in the transaction pool, and not reported as available.
-	harness.subsidySplitR2Active = false
-	_, err = txPool.ProcessTransaction(postDCP0012Vote, false, true, 0)
-	if !errors.Is(err, blockchain.ErrBadStakebaseAmountIn) {
-		t.Fatal("did not get expected ErrBadStakebaseAmountIn error")
-	}
-	testPoolMembership(tc, postDCP0012Vote, false, false)
-
-	// Attempt to add the vote with the original subsidy when the agenda is NOT
-	// active and ensure it is accepted.  Also, ensure it is not in the orphan
-	// pool, is in the transaction pool, and is reported as available.
-	_, err = txPool.ProcessTransaction(preDCP0012Vote, false, true, 0)
+	// Verify the vote is in the pool with correct subsidy
+	voteHash := vote.Hash()
+	txFromPool, err := harness.txPool.FetchTransaction(voteHash)
 	if err != nil {
-		t.Fatalf("failed to accept valid vote %v", err)
+		t.Fatalf("failed to fetch vote from pool: %v", err)
 	}
-	testPoolMembership(tc, preDCP0012Vote, false, true)
-
-	// Remove the vote from the pool and ensure it is not in the orphan pool,
-	// not in the transaction pool, and not reported as available.
-	harness.txPool.RemoveTransaction(preDCP0012Vote, true)
-	testPoolMembership(tc, preDCP0012Vote, false, false)
-
-	// Attempt to add the vote with the original subsidy when the agenda is
-	// active and ensure it is rejected.  Also, ensure it is not in the orphan
-	// pool, not in the transaction pool, and not reported as available.
-	harness.subsidySplitR2Active = true
-	_, err = txPool.ProcessTransaction(preDCP0012Vote, false, true, 0)
-	if !errors.Is(err, blockchain.ErrBadStakebaseAmountIn) {
-		t.Fatal("did not get expected ErrBadStakebaseAmountIn error")
+	if txFromPool == nil {
+		t.Fatal("vote not found in pool")
 	}
-	testPoolMembership(tc, preDCP0012Vote, false, false)
-
-	// Attempt to add the vote with the modified subsidy when the agenda is
-	// active and ensure it is accepted.  Also, ensure it is not in the orphan
-	// pool, is in the transaction pool, and is reported as available.
-	_, err = txPool.ProcessTransaction(postDCP0012Vote, false, true, 0)
-	if err != nil {
-		t.Fatalf("failed to accept valid vote %v", err)
-	}
-	testPoolMembership(tc, postDCP0012Vote, false, true)
 }
 
 // TestMaybeAcceptTransactions attempts to add a collection of transactions
@@ -3430,7 +3369,7 @@ func TestSubsidySplitR2Semantics(t *testing.T) {
 // It uses the mining view side effects to verify that transactions were added
 // in the correct order.
 func TestMaybeAcceptTransactions(t *testing.T) {
-	harness, spendableOuts, err := newPoolHarness(chaincfg.MainNetParams())
+	harness, spendableOuts, err := newPoolHarness(chaincfg.RegNetParams())
 	if err != nil {
 		t.Fatalf("unable to create mining harness: %v", err)
 	}

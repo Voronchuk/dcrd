@@ -38,6 +38,7 @@ import (
 	"github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/crypto/rand"
 	"github.com/decred/dcrd/database/v3"
@@ -170,83 +171,88 @@ type commandHandler func(context.Context, *Server, interface{}) (interface{}, er
 // a dependency loop.
 var rpcHandlers map[types.Method]commandHandler
 var rpcHandlersBeforeInit = map[types.Method]commandHandler{
-	"addnode":               handleAddNode,
-	"createrawsstx":         handleCreateRawSStx,
-	"createrawssrtx":        handleCreateRawSSRtx,
-	"createrawtransaction":  handleCreateRawTransaction,
-	"debuglevel":            handleDebugLevel,
-	"decoderawtransaction":  handleDecodeRawTransaction,
-	"decodescript":          handleDecodeScript,
-	"estimatefee":           handleEstimateFee,
-	"estimatesmartfee":      handleEstimateSmartFee,
-	"estimatestakediff":     handleEstimateStakeDiff,
-	"existsaddress":         handleExistsAddress,
-	"existsaddresses":       handleExistsAddresses,
-	"existsliveticket":      handleExistsLiveTicket,
-	"existslivetickets":     handleExistsLiveTickets,
-	"existsmempooltxs":      handleExistsMempoolTxs,
-	"generate":              handleGenerate,
-	"getaddednodeinfo":      handleGetAddedNodeInfo,
-	"getbestblock":          handleGetBestBlock,
-	"getbestblockhash":      handleGetBestBlockHash,
-	"getblock":              handleGetBlock,
-	"getblockchaininfo":     handleGetBlockchainInfo,
-	"getblockcount":         handleGetBlockCount,
-	"getblockhash":          handleGetBlockHash,
-	"getblockheader":        handleGetBlockHeader,
-	"getblocksubsidy":       handleGetBlockSubsidy,
-	"getcfilterv2":          handleGetCFilterV2,
-	"getchaintips":          handleGetChainTips,
-	"getcoinsupply":         handleGetCoinSupply,
-	"getconnectioncount":    handleGetConnectionCount,
-	"getcurrentnet":         handleGetCurrentNet,
-	"getdifficulty":         handleGetDifficulty,
-	"getgenerate":           handleGetGenerate,
-	"gethashespersec":       handleGetHashesPerSec,
-	"getheaders":            handleGetHeaders,
-	"getinfo":               handleGetInfo,
-	"getmempoolinfo":        handleGetMempoolInfo,
-	"getmininginfo":         handleGetMiningInfo,
-	"getmixmessage":         handleGetMixMessage,
-	"getmixpairrequests":    handleGetMixPairRequests,
-	"getnettotals":          handleGetNetTotals,
-	"getnetworkhashps":      handleGetNetworkHashPS,
-	"getnetworkinfo":        handleGetNetworkInfo,
-	"getpeerinfo":           handleGetPeerInfo,
-	"getrawmempool":         handleGetRawMempool,
-	"getrawtransaction":     handleGetRawTransaction,
-	"getstakedifficulty":    handleGetStakeDifficulty,
-	"getstakeversioninfo":   handleGetStakeVersionInfo,
-	"getstakeversions":      handleGetStakeVersions,
-	"getticketpoolvalue":    handleGetTicketPoolValue,
-	"gettreasurybalance":    handleGetTreasuryBalance,
-	"gettreasuryspendvotes": handleGetTreasurySpendVotes,
-	"getvoteinfo":           handleGetVoteInfo,
-	"gettxout":              handleGetTxOut,
-	"gettxoutsetinfo":       handleGetTxOutSetInfo,
-	"getwork":               handleGetWork,
-	"help":                  handleHelp,
-	"invalidateblock":       handleInvalidateBlock,
-	"livetickets":           handleLiveTickets,
-	"node":                  handleNode,
-	"ping":                  handlePing,
-	"reconsiderblock":       handleReconsiderBlock,
-	"regentemplate":         handleRegenTemplate,
-	"sendrawmixmessage":     handleSendRawMixMessage,
-	"sendrawtransaction":    handleSendRawTransaction,
-	"setgenerate":           handleSetGenerate,
-	"startprofiler":         handleStartProfiler,
-	"stop":                  handleStop,
-	"stopprofiler":          handleStopProfiler,
-	"submitblock":           handleSubmitBlock,
-	"ticketfeeinfo":         handleTicketFeeInfo,
-	"ticketsforaddress":     handleTicketsForAddress,
-	"ticketvwap":            handleTicketVWAP,
-	"txfeeinfo":             handleTxFeeInfo,
-	"validateaddress":       handleValidateAddress,
-	"verifychain":           handleVerifyChain,
-	"verifymessage":         handleVerifyMessage,
-	"version":               handleVersion,
+	"addnode":                  handleAddNode,
+	"createrawsstx":            handleCreateRawSStx,
+	"createrawssrtx":           handleCreateRawSSRtx,
+	"createrawtransaction":     handleCreateRawTransaction,
+	"debuglevel":               handleDebugLevel,
+	"decoderawtransaction":     handleDecodeRawTransaction,
+	"decodescript":             handleDecodeScript,
+	"estimatefee":              handleEstimateFee,
+	"estimatesmartfee":         handleEstimateSmartFee,
+	"getfeestimatesbycointype": handleGetFeeEstimatesByCoinType,
+	"estimatestakediff":        handleEstimateStakeDiff,
+	"existsaddress":            handleExistsAddress,
+	"existsaddresses":          handleExistsAddresses,
+	"existsliveticket":         handleExistsLiveTicket,
+	"existslivetickets":        handleExistsLiveTickets,
+	"existsmempooltxs":         handleExistsMempoolTxs,
+	"generate":                 handleGenerate,
+	"getaddednodeinfo":         handleGetAddedNodeInfo,
+	"getbestblock":             handleGetBestBlock,
+	"getbestblockhash":         handleGetBestBlockHash,
+	"getblock":                 handleGetBlock,
+	"getblockchaininfo":        handleGetBlockchainInfo,
+	"getblockcount":            handleGetBlockCount,
+	"getblockhash":             handleGetBlockHash,
+	"getblockheader":           handleGetBlockHeader,
+	"getblocksubsidy":          handleGetBlockSubsidy,
+	"getcfilterv2":             handleGetCFilterV2,
+	"getchaintips":             handleGetChainTips,
+	"getcoinsupply":            handleGetCoinSupply,
+	"getconnectioncount":       handleGetConnectionCount,
+	"getcurrentnet":            handleGetCurrentNet,
+	"getdifficulty":            handleGetDifficulty,
+	"getgenerate":              handleGetGenerate,
+	"gethashespersec":          handleGetHashesPerSec,
+	"getheaders":               handleGetHeaders,
+	"getinfo":                  handleGetInfo,
+	"getmempoolinfo":           handleGetMempoolInfo,
+	"getmempoolfeesinfo":       handleGetMempoolFeesInfo,
+	"getmininginfo":            handleGetMiningInfo,
+	"getmixmessage":            handleGetMixMessage,
+	"getmixpairrequests":       handleGetMixPairRequests,
+	"getnettotals":             handleGetNetTotals,
+	"getnetworkhashps":         handleGetNetworkHashPS,
+	"getnetworkinfo":           handleGetNetworkInfo,
+	"getpeerinfo":              handleGetPeerInfo,
+	"getrawmempool":            handleGetRawMempool,
+	"getrawtransaction":        handleGetRawTransaction,
+	"getskainfo":               handleGetSKAInfo,
+	"getemissionstatus":        handleGetEmissionStatus,
+	"getburnedcoins":           handleGetBurnedCoins,
+	"getstakedifficulty":       handleGetStakeDifficulty,
+	"getstakeversioninfo":      handleGetStakeVersionInfo,
+	"getstakeversions":         handleGetStakeVersions,
+	"getticketpoolvalue":       handleGetTicketPoolValue,
+	"gettreasurybalance":       handleGetTreasuryBalance,
+	"gettreasuryspendvotes":    handleGetTreasurySpendVotes,
+	"getvoteinfo":              handleGetVoteInfo,
+	"gettxout":                 handleGetTxOut,
+	"gettxoutsetinfo":          handleGetTxOutSetInfo,
+	"getwork":                  handleGetWork,
+	"help":                     handleHelp,
+	"invalidateblock":          handleInvalidateBlock,
+	"livetickets":              handleLiveTickets,
+	"node":                     handleNode,
+	"ping":                     handlePing,
+	"reconsiderblock":          handleReconsiderBlock,
+	"regentemplate":            handleRegenTemplate,
+	"sendrawmixmessage":        handleSendRawMixMessage,
+	"sendrawtransaction":       handleSendRawTransaction,
+	"setgenerate":              handleSetGenerate,
+	"startprofiler":            handleStartProfiler,
+	"stop":                     handleStop,
+	"stopprofiler":             handleStopProfiler,
+	"submitblock":              handleSubmitBlock,
+	"ticketfeeinfo":            handleTicketFeeInfo,
+	"ticketsforaddress":        handleTicketsForAddress,
+	"ticketvwap":               handleTicketVWAP,
+	"txfeeinfo":                handleTxFeeInfo,
+	"validateaddress":          handleValidateAddress,
+	"verifychain":              handleVerifyChain,
+	"verifymessage":            handleVerifyMessage,
+	"version":                  handleVersion,
 }
 
 // list of commands that we recognize, but for which dcrd has no support because
@@ -350,59 +356,61 @@ var rpcLimited = map[string]struct{}{
 	"help": {},
 
 	// HTTP/S-only commands
-	"createrawsstx":        {},
-	"createrawssrtx":       {},
-	"createrawtransaction": {},
-	"decoderawtransaction": {},
-	"decodescript":         {},
-	"estimatefee":          {},
-	"estimatesmartfee":     {},
-	"estimatestakediff":    {},
-	"existsaddress":        {},
-	"existsaddresses":      {},
-	"existsliveticket":     {},
-	"existslivetickets":    {},
-	"existsmempooltxs":     {},
-	"getbestblock":         {},
-	"getbestblockhash":     {},
-	"getblock":             {},
-	"getblockchaininfo":    {},
-	"getblockcount":        {},
-	"getblockhash":         {},
-	"getblockheader":       {},
-	"getblocksubsidy":      {},
-	"getcfilterv2":         {},
-	"getchaintips":         {},
-	"getcoinsupply":        {},
-	"getcurrentnet":        {},
-	"getdifficulty":        {},
-	"getheaders":           {},
-	"getinfo":              {},
-	"getmixmessage":        {},
-	"getmixpairrequests":   {},
-	"getnettotals":         {},
-	"getnetworkhashps":     {},
-	"getnetworkinfo":       {},
-	"getrawmempool":        {},
-	"getstakedifficulty":   {},
-	"getstakeversioninfo":  {},
-	"getstakeversions":     {},
-	"getrawtransaction":    {},
-	"gettreasurybalance":   {},
-	"gettxout":             {},
-	"getvoteinfo":          {},
-	"livetickets":          {},
-	"regentemplate":        {},
-	"sendrawmixmessage":    {},
-	"sendrawtransaction":   {},
-	"submitblock":          {},
-	"ticketfeeinfo":        {},
-	"ticketsforaddress":    {},
-	"ticketvwap":           {},
-	"txfeeinfo":            {},
-	"validateaddress":      {},
-	"verifymessage":        {},
-	"version":              {},
+	"createrawsstx":            {},
+	"createrawssrtx":           {},
+	"createrawtransaction":     {},
+	"decoderawtransaction":     {},
+	"decodescript":             {},
+	"estimatefee":              {},
+	"estimatesmartfee":         {},
+	"getfeestimatesbycointype": {},
+	"getmempoolfeesinfo":       {},
+	"estimatestakediff":        {},
+	"existsaddress":            {},
+	"existsaddresses":          {},
+	"existsliveticket":         {},
+	"existslivetickets":        {},
+	"existsmempooltxs":         {},
+	"getbestblock":             {},
+	"getbestblockhash":         {},
+	"getblock":                 {},
+	"getblockchaininfo":        {},
+	"getblockcount":            {},
+	"getblockhash":             {},
+	"getblockheader":           {},
+	"getblocksubsidy":          {},
+	"getcfilterv2":             {},
+	"getchaintips":             {},
+	"getcoinsupply":            {},
+	"getcurrentnet":            {},
+	"getdifficulty":            {},
+	"getheaders":               {},
+	"getinfo":                  {},
+	"getmixmessage":            {},
+	"getmixpairrequests":       {},
+	"getnettotals":             {},
+	"getnetworkhashps":         {},
+	"getnetworkinfo":           {},
+	"getrawmempool":            {},
+	"getstakedifficulty":       {},
+	"getstakeversioninfo":      {},
+	"getstakeversions":         {},
+	"getrawtransaction":        {},
+	"gettreasurybalance":       {},
+	"gettxout":                 {},
+	"getvoteinfo":              {},
+	"livetickets":              {},
+	"regentemplate":            {},
+	"sendrawmixmessage":        {},
+	"sendrawtransaction":       {},
+	"submitblock":              {},
+	"ticketfeeinfo":            {},
+	"ticketsforaddress":        {},
+	"ticketvwap":               {},
+	"txfeeinfo":                {},
+	"validateaddress":          {},
+	"verifymessage":            {},
+	"version":                  {},
 }
 
 // rpcInternalErr is a convenience function to convert an internal error to an
@@ -723,6 +731,7 @@ func (s *Server) messageToHex(msg wire.Message) (string, error) {
 func newTxOut(amount int64, pkScriptVer uint16, pkScript []byte) *wire.TxOut {
 	return &wire.TxOut{
 		Value:    amount,
+		CoinType: cointype.CoinTypeVAR, // Default to VAR for backward compatibility
 		Version:  pkScriptVer,
 		PkScript: pkScript,
 	}
@@ -784,9 +793,9 @@ func handleCreateRawTransaction(_ context.Context, s *Server, cmd interface{}) (
 		}
 
 		// Ensure amount is in the valid range for monetary amounts.
-		if atoms <= 0 || atoms > dcrutil.MaxAmount {
+		if atoms <= 0 || int64(atoms) > int64(cointype.MaxVARAmount) {
 			return nil, rpcInvalidError("Invalid amount: 0 >= %v "+
-				"> %v", amount, dcrutil.MaxAmount)
+				"> %v", amount, cointype.MaxVARAmount)
 		}
 
 		// Decode the provided address.  This also ensures the network encoded
@@ -868,10 +877,10 @@ func handleCreateRawSStx(_ context.Context, s *Server, cmd interface{}) (interfa
 
 	for encodedAddr, amount := range c.Amount {
 		// Ensure amount is in the valid range for monetary amounts.
-		if amount <= 0 || amount > dcrutil.MaxAmount {
+		if amount <= 0 || amount > int64(cointype.MaxVARAmount) {
 			return nil, rpcInvalidError("Invalid SSTx commitment "+
 				"amount: 0 >= %v > %v", amount,
-				dcrutil.MaxAmount)
+				cointype.MaxVARAmount)
 		}
 
 		// Decode the provided address.  This also ensures the network encoded
@@ -949,9 +958,9 @@ func handleCreateRawSStx(_ context.Context, s *Server, cmd interface{}) (interfa
 		// 2. Append change output.
 
 		// Ensure amount is in the valid range for monetary amounts.
-		if cout.ChangeAmt < 0 || cout.ChangeAmt > dcrutil.MaxAmount {
+		if cout.ChangeAmt < 0 || cout.ChangeAmt > int64(cointype.MaxVARAmount) {
 			return nil, rpcInvalidError("Invalid change amount: 0 "+
-				"> %v > %v", cout.ChangeAmt, dcrutil.MaxAmount)
+				"> %v > %v", cout.ChangeAmt, cointype.MaxVARAmount)
 		}
 
 		// Decode the provided address.  This also ensures the network encoded
@@ -1284,6 +1293,7 @@ func createVoutList(mtx *wire.MsgTx, chainParams *chaincfg.Params,
 		vout.N = uint32(i)
 		vout.Value = dcrutil.Amount(v.Value).ToCoin()
 		vout.Version = v.Version
+		vout.CoinType = uint8(v.CoinType)
 		voutSPK.Addresses = encodedAddrs
 		voutSPK.Asm = disbuf
 		voutSPK.Hex = hex.EncodeToString(v.PkScript)
@@ -1311,6 +1321,42 @@ func (s *Server) createTxRawResult(chainParams *chaincfg.Params,
 	if err != nil {
 		return nil, err
 	}
+
+	if txHash != mtx.TxHash().String() {
+		return nil, rpcInvalidError("Tx hash does not match: got %v "+
+			"expected %v", txHash, mtx.TxHash())
+	}
+
+	txReply := &types.TxRawResult{
+		Hex:         mtxHex,
+		Txid:        txHash,
+		Vin:         createVinList(mtx, isTreasuryEnabled),
+		Vout:        createVoutList(mtx, chainParams, nil),
+		Version:     int32(mtx.Version),
+		LockTime:    mtx.LockTime,
+		Expiry:      mtx.Expiry,
+		BlockHeight: blkHeight,
+		BlockIndex:  blkIdx,
+	}
+
+	if blkHeader != nil {
+		// This is not a typo, they are identical in bitcoind as well.
+		txReply.Time = blkHeader.Timestamp.Unix()
+		txReply.Blocktime = blkHeader.Timestamp.Unix()
+		txReply.BlockHash = blkHash
+		txReply.Confirmations = confirmations
+	}
+
+	return txReply, nil
+}
+
+// createTxRawResultWithHex creates a TxRawResult using the provided hex string
+// instead of re-serializing the transaction. This is used for legacy transactions
+// to preserve the original format.
+func (s *Server) createTxRawResultWithHex(chainParams *chaincfg.Params,
+	mtx *wire.MsgTx, mtxHex string, txHash string, blkIdx uint32, blkHeader *wire.BlockHeader,
+	blkHash string, blkHeight int64, confirmations int64,
+	isTreasuryEnabled bool) (*types.TxRawResult, error) {
 
 	if txHash != mtx.TxHash().String() {
 		return nil, rpcInvalidError("Tx hash does not match: got %v "+
@@ -1449,6 +1495,7 @@ func handleEstimateFee(_ context.Context, s *Server, cmd interface{}) (interface
 //
 // The default estimation mode when unset is assumed as "conservative". As of
 // 2018-12, the only supported mode is "conservative".
+// Enhanced to support optional coin type parameter for dual-coin system.
 func handleEstimateSmartFee(_ context.Context, s *Server, cmd interface{}) (interface{}, error) {
 	c := cmd.(*types.EstimateSmartFeeCmd)
 
@@ -1462,6 +1509,38 @@ func handleEstimateSmartFee(_ context.Context, s *Server, cmd interface{}) (inte
 			"are supported for smart fee estimation at the moment")
 	}
 
+	// Default to VAR (coin type 0) if not specified
+	coinType := uint8(0)
+	if c.CoinType != nil {
+		coinType = *c.CoinType
+		// Validate coin type range
+		if coinType > 255 {
+			return nil, rpcInvalidError("coin type must be between 0 and 255")
+		}
+	}
+
+	// Use coin-type-aware fee estimation if available
+	if s.cfg.CoinTypeFeeCalculator != nil {
+		feeRate, err := s.cfg.CoinTypeFeeCalculator.EstimateFeeRate(cointype.CoinType(coinType), int(c.Confirmations))
+		if err != nil {
+			// Fall back to standard fee estimator
+			fee, err := s.cfg.FeeEstimator.EstimateFee(int32(c.Confirmations))
+			if err != nil {
+				return nil, rpcInternalErr(err, "Could not estimate fee")
+			}
+			return &types.EstimateSmartFeeResult{
+				FeeRate: fee.ToCoin(),
+				Blocks:  c.Confirmations,
+			}, nil
+		}
+
+		return &types.EstimateSmartFeeResult{
+			FeeRate: feeRate.ToCoin(),
+			Blocks:  c.Confirmations,
+		}, nil
+	}
+
+	// Standard fee estimation (backward compatibility)
 	fee, err := s.cfg.FeeEstimator.EstimateFee(int32(c.Confirmations))
 	if err != nil {
 		return nil, rpcInternalErr(err, "Could not estimate fee")
@@ -1470,6 +1549,73 @@ func handleEstimateSmartFee(_ context.Context, s *Server, cmd interface{}) (inte
 	return &types.EstimateSmartFeeResult{
 		FeeRate: fee.ToCoin(),
 		Blocks:  c.Confirmations,
+	}, nil
+}
+
+// handleGetFeeEstimatesByCoinType implements the getfeestimatesbycointype command.
+func handleGetFeeEstimatesByCoinType(_ context.Context, s *Server, cmd interface{}) (interface{}, error) {
+	c := cmd.(*types.GetFeeEstimatesByCoinTypeCmd)
+
+	// Default confirmations to 1 if not specified
+	confirmations := int64(1)
+	if c.Confirmations != nil {
+		confirmations = *c.Confirmations
+	}
+
+	// Validate coin type
+	if c.CoinType > 255 {
+		return nil, rpcInvalidError("coin type must be between 0 and 255")
+	}
+
+	// Get fee calculator from configuration if available
+	if s.cfg.CoinTypeFeeCalculator == nil {
+		// Fallback to basic fee estimation for the specified coin type
+		fee, err := s.cfg.FeeEstimator.EstimateFee(int32(confirmations))
+		if err != nil {
+			// nolint: nilerr
+			return &types.GetFeeResult{
+				CoinType: c.CoinType,
+				Errors:   []string{"fee estimation unavailable"},
+			}, nil
+		}
+
+		feeRate := fee.ToCoin()
+		return &types.GetFeeResult{
+			CoinType:             c.CoinType,
+			MinRelayFee:          feeRate,
+			DynamicFeeMultiplier: 1.0,
+			FastFee:              feeRate * 2.0,
+			NormalFee:            feeRate,
+			SlowFee:              feeRate * 0.5,
+			PendingTxCount:       0,
+			PendingTxSize:        0,
+			BlockSpaceUsed:       0.0,
+			LastUpdated:          0,
+		}, nil
+	}
+
+	// Get comprehensive fee statistics for the coin type
+	coinType := cointype.CoinType(c.CoinType)
+	feeStats, err2 := s.cfg.CoinTypeFeeCalculator.GetFeeStats(coinType)
+	if err2 != nil {
+		// nolint: nilerr
+		return &types.GetFeeResult{
+			CoinType: c.CoinType,
+			Errors:   []string{err2.Error()},
+		}, nil
+	}
+
+	return &types.GetFeeResult{
+		CoinType:             c.CoinType,
+		MinRelayFee:          feeStats.MinRelayFee.ToCoin(),
+		DynamicFeeMultiplier: feeStats.DynamicFeeMultiplier,
+		FastFee:              feeStats.FastFee.ToCoin(),
+		NormalFee:            feeStats.NormalFee.ToCoin(),
+		SlowFee:              feeStats.SlowFee.ToCoin(),
+		PendingTxCount:       feeStats.PendingTxCount,
+		PendingTxSize:        feeStats.PendingTxSize,
+		BlockSpaceUsed:       feeStats.BlockSpaceUsed,
+		LastUpdated:          feeStats.LastUpdated.Unix(),
 	}, nil
 }
 
@@ -1577,10 +1723,14 @@ func handleExistsAddress(_ context.Context, s *Server, cmd interface{}) (interfa
 		return nil, rpcInternalErr(err, "Sync")
 	}
 
+	timer := time.NewTimer(syncWait)
+	defer timer.Stop()
+
 sync:
 	for !chain.BestSnapshot().Hash.IsEqual(tHash) {
+		timer.Reset(syncWait)
 		select {
-		case <-time.After(syncWait):
+		case <-timer.C:
 			err := fmt.Errorf("%s: index not synced", existsAddrIndex.Name())
 			return nil, rpcInternalErr(err, "Sync")
 		case <-existsAddrIndex.WaitForSync():
@@ -1634,10 +1784,14 @@ func handleExistsAddresses(_ context.Context, s *Server, cmd interface{}) (inter
 		return nil, rpcInternalErr(err, "Sync")
 	}
 
+	timer := time.NewTimer(syncWait)
+	defer timer.Stop()
+
 sync:
 	for !chain.BestSnapshot().Hash.IsEqual(tHash) {
+		timer.Reset(syncWait)
 		select {
-		case <-time.After(syncWait):
+		case <-timer.C:
 			err := fmt.Errorf("%s: index not synced", existsAddrIndex.Name())
 			return nil, rpcInternalErr(err, "Sync")
 		case <-existsAddrIndex.WaitForSync():
@@ -1973,7 +2127,7 @@ func handleGetBlock(_ context.Context, s *Server, cmd interface{}) (interface{},
 		confirmations = 1 + best.Height - int64(blockHeader.Height)
 	}
 
-	sbitsFloat := float64(blockHeader.SBits) / dcrutil.AtomsPerCoin
+	sbitsFloat := float64(blockHeader.SBits) / cointype.AtomsPerVAR
 
 	medianTime, err := chain.MedianTimeByHash(hash)
 	if err != nil {
@@ -2333,24 +2487,11 @@ func handleGetBlockSubsidy(_ context.Context, s *Server, cmd interface{}) (inter
 	if err != nil {
 		return nil, err
 	}
-	isSubsidyEnabled, err := s.isSubsidySplitAgendaActive(&prevBlkHash)
-	if err != nil {
-		return nil, err
-	}
-	isSubsidyR2Enabled, err := s.isSubsidySplitR2AgendaActive(&prevBlkHash)
-	if err != nil {
-		return nil, err
-	}
 
-	// Determine which subsidy split variant to use depending on the active
-	// agendas.
-	subsidySplitVariant := standalone.SSVOriginal
-	switch {
-	case isSubsidyR2Enabled:
-		subsidySplitVariant = standalone.SSVDCP0012
-	case isSubsidyEnabled:
-		subsidySplitVariant = standalone.SSVDCP0010
-	}
+	// Use Monetarium subsidy split (50% miners, 50% stakers, 0% treasury)
+	// Note: We're not checking DCP agenda activation since we always want
+	// to use the Monetarium split for production
+	subsidySplitVariant := standalone.SSVMonetarium
 
 	subsidyCache := s.cfg.SubsidyCache
 	dev := subsidyCache.CalcTreasurySubsidy(height, voters, isTreasuryEnabled)
@@ -2533,6 +2674,235 @@ func handleGetMempoolInfo(_ context.Context, s *Server, _ interface{}) (interfac
 	}
 
 	return ret, nil
+}
+
+// handleGetMempoolFeesInfo implements the getmempoolfeesinfo command.
+func handleGetMempoolFeesInfo(_ context.Context, s *Server, cmd interface{}) (interface{}, error) {
+	c := cmd.(*types.GetMempoolFeesInfoCmd)
+
+	// Get all mempool transactions
+	mempoolTxns := s.cfg.TxMempooler.TxDescs()
+	if len(mempoolTxns) == 0 {
+		// Empty mempool
+		return &types.GetMempoolFeesInfoResult{
+			CoinTypes:    make(map[string]types.MempoolCoinTypeFeeInfo),
+			TotalTxCount: 0,
+			TotalSize:    0,
+			LastUpdated:  time.Now().Unix(),
+		}, nil
+	}
+
+	// Group transactions by coin type
+	coinTypeTxs := make(map[cointype.CoinType][]*mempool.TxDesc)
+	totalTxCount := 0
+	totalSize := int64(0)
+
+	for _, txDesc := range mempoolTxns {
+		// Skip feeless system transactions (votes and revocations) from fee statistics
+		if txDesc.Type == stake.TxTypeSSGen || txDesc.Type == stake.TxTypeSSRtx {
+			continue
+		}
+
+		// Determine the primary coin type for this transaction
+		// For simplicity, use the coin type of the first output
+		msgTx := txDesc.Tx.MsgTx()
+		if len(msgTx.TxOut) == 0 {
+			continue // Skip transactions with no outputs
+		}
+
+		coinType := msgTx.TxOut[0].CoinType
+		coinTypeTxs[coinType] = append(coinTypeTxs[coinType], txDesc)
+		totalTxCount++
+		totalSize += int64(msgTx.SerializeSize())
+	}
+
+	// If coin type filter is specified, filter results
+	var filteredCoinTypes []cointype.CoinType
+	if c.CoinType != nil {
+		targetCoinType := cointype.CoinType(*c.CoinType)
+		if _, exists := coinTypeTxs[targetCoinType]; exists {
+			filteredCoinTypes = []cointype.CoinType{targetCoinType}
+		} else {
+			// No transactions for the specified coin type
+			return &types.GetMempoolFeesInfoResult{
+				CoinTypes:    make(map[string]types.MempoolCoinTypeFeeInfo),
+				TotalTxCount: 0,
+				TotalSize:    0,
+				LastUpdated:  time.Now().Unix(),
+			}, nil
+		}
+	} else {
+		// Include all coin types
+		for coinType := range coinTypeTxs {
+			filteredCoinTypes = append(filteredCoinTypes, coinType)
+		}
+	}
+
+	// Calculate fee statistics for each coin type
+	coinTypeResults := make(map[string]types.MempoolCoinTypeFeeInfo)
+	now := time.Now()
+
+	for _, coinType := range filteredCoinTypes {
+		txs := coinTypeTxs[coinType]
+		if len(txs) == 0 {
+			continue
+		}
+
+		// Calculate fee rates and statistics
+		feeRates := make([]float64, 0, len(txs))
+		sizes := make([]int64, 0, len(txs))
+		totalFees := float64(0)
+		totalCoinTypeSize := int64(0)
+		oldestTime := now
+		newestTime := time.Time{}
+
+		for _, txDesc := range txs {
+			msgTx := txDesc.Tx.MsgTx()
+			size := int64(msgTx.SerializeSize())
+			feeRate := float64(txDesc.Fee) / (float64(size) / 1000.0) // atoms per KB
+
+			feeRates = append(feeRates, feeRate)
+			sizes = append(sizes, size)
+			totalFees += dcrutil.Amount(txDesc.Fee).ToCoin()
+			totalCoinTypeSize += size
+
+			// Track oldest and newest transaction times
+			if txDesc.Added.Before(oldestTime) {
+				oldestTime = txDesc.Added
+			}
+			if txDesc.Added.After(newestTime) {
+				newestTime = txDesc.Added
+			}
+		}
+
+		// Calculate statistics
+		minFee, maxFee, avgFee := calculateFeeStats(feeRates)
+		medianFee := calculatePercentile(feeRates, 0.50)
+		p25Fee := calculatePercentile(feeRates, 0.25)
+		p75Fee := calculatePercentile(feeRates, 0.75)
+		p90Fee := calculatePercentile(feeRates, 0.90)
+		avgSize := float64(totalCoinTypeSize) / float64(len(txs))
+
+		// Enforce minimum relay fee floor - no fee estimate should be below minRelayFee
+		// This ensures fee estimates are always acceptable to the mempool
+		minRelayFee := float64(s.cfg.MinRelayTxFee)
+		if minFee < minRelayFee {
+			minFee = minRelayFee
+		}
+		if medianFee < minRelayFee {
+			medianFee = minRelayFee
+		}
+		if p25Fee < minRelayFee {
+			p25Fee = minRelayFee
+		}
+		if p75Fee < minRelayFee {
+			p75Fee = minRelayFee
+		}
+		if p90Fee < minRelayFee {
+			p90Fee = minRelayFee
+		}
+
+		// Calculate utilization rate (simplified - could be enhanced with actual block space limits)
+		utilizationRate := float64(totalCoinTypeSize) / (1024 * 1024) * 100 // Percentage based on 1MB blocks
+
+		// Convert fee rates from atoms/KB to DCR/KB
+		minFeeDCR := dcrutil.Amount(int64(minFee)).ToCoin()
+		maxFeeDCR := dcrutil.Amount(int64(maxFee)).ToCoin()
+		avgFeeDCR := dcrutil.Amount(int64(avgFee)).ToCoin()
+		medianFeeDCR := dcrutil.Amount(int64(medianFee)).ToCoin()
+		p25FeeDCR := dcrutil.Amount(int64(p25Fee)).ToCoin()
+		p75FeeDCR := dcrutil.Amount(int64(p75Fee)).ToCoin()
+		p90FeeDCR := dcrutil.Amount(int64(p90Fee)).ToCoin()
+
+		// Generate coin type name
+		coinTypeName := generateCoinTypeName(coinType)
+
+		coinTypeResults[coinTypeName] = types.MempoolCoinTypeFeeInfo{
+			CoinType:        uint8(coinType),
+			Name:            coinTypeName,
+			TxCount:         len(txs),
+			TotalSize:       totalCoinTypeSize,
+			AverageSize:     avgSize,
+			MinFee:          minFeeDCR,
+			MaxFee:          maxFeeDCR,
+			AverageFee:      avgFeeDCR,
+			MedianFee:       medianFeeDCR,
+			P25Fee:          p25FeeDCR,
+			P75Fee:          p75FeeDCR,
+			P90Fee:          p90FeeDCR,
+			TotalFees:       totalFees,
+			OldestTxTime:    oldestTime.Unix(),
+			NewestTxTime:    newestTime.Unix(),
+			UtilizationRate: utilizationRate,
+		}
+	}
+
+	return &types.GetMempoolFeesInfoResult{
+		CoinTypes:    coinTypeResults,
+		TotalTxCount: totalTxCount,
+		TotalSize:    totalSize,
+		LastUpdated:  now.Unix(),
+	}, nil
+}
+
+// Helper function to calculate basic fee statistics
+func calculateFeeStats(feeRates []float64) (min, max, avg float64) {
+	if len(feeRates) == 0 {
+		return 0, 0, 0
+	}
+
+	min = feeRates[0]
+	max = feeRates[0]
+	sum := float64(0)
+
+	for _, rate := range feeRates {
+		if rate < min {
+			min = rate
+		}
+		if rate > max {
+			max = rate
+		}
+		sum += rate
+	}
+
+	avg = sum / float64(len(feeRates))
+	return min, max, avg
+}
+
+// Helper function to calculate percentiles
+func calculatePercentile(values []float64, percentile float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+
+	// Use standard library sort for O(n log n) performance
+	sorted := make([]float64, len(values))
+	copy(sorted, values)
+	sort.Float64s(sorted)
+
+	index := percentile * float64(len(sorted)-1)
+	lower := int(index)
+	upper := lower + 1
+
+	if upper >= len(sorted) {
+		return sorted[len(sorted)-1]
+	}
+
+	weight := index - float64(lower)
+	return sorted[lower]*(1-weight) + sorted[upper]*weight
+}
+
+// Helper function to generate coin type names
+func generateCoinTypeName(coinType cointype.CoinType) string {
+	switch coinType {
+	case cointype.CoinTypeVAR:
+		return "VAR"
+	default:
+		if coinType >= 1 && coinType <= 255 {
+			return fmt.Sprintf("SKA-%d", coinType)
+		}
+		return fmt.Sprintf("Unknown-%d", coinType)
+	}
 }
 
 // handleGetMiningInfo implements the getmininginfo command. We only return the
@@ -2891,6 +3261,8 @@ func handleGetRawTransaction(_ context.Context, s *Server, cmd interface{}) (int
 	var blkHash *chainhash.Hash
 	var blkHeight int64
 	var blkIndex uint32
+	var isLegacyFormat bool
+	var originalTxBytes []byte
 	chain := s.cfg.Chain
 	txIndex := s.cfg.TxIndexer
 	tx, err := s.cfg.TxMempooler.FetchTransaction(txHash)
@@ -2916,10 +3288,14 @@ func handleGetRawTransaction(_ context.Context, s *Server, cmd interface{}) (int
 			return nil, rpcInternalErr(err, "Sync")
 		}
 
+		timer := time.NewTimer(syncWait)
+		defer timer.Stop()
+
 	sync:
 		for !chain.BestSnapshot().Hash.IsEqual(tHash) {
+			timer.Reset(syncWait)
 			select {
-			case <-time.After(syncWait):
+			case <-timer.C:
 				err := fmt.Errorf("%s: index not synced", txIndex.Name())
 				return nil, rpcInternalErr(err, "Sync")
 			case <-txIndex.WaitForSync():
@@ -2939,10 +3315,9 @@ func handleGetRawTransaction(_ context.Context, s *Server, cmd interface{}) (int
 		blockRegion := &idxEntry.BlockRegion
 
 		// Load the raw transaction bytes from the database.
-		var txBytes []byte
 		err = s.cfg.DB.View(func(dbTx database.Tx) error {
 			var err error
-			txBytes, err = dbTx.FetchBlockRegion(blockRegion)
+			originalTxBytes, err = dbTx.FetchBlockRegion(blockRegion)
 			return err
 		})
 		if err != nil {
@@ -2953,7 +3328,7 @@ func handleGetRawTransaction(_ context.Context, s *Server, cmd interface{}) (int
 		// transaction as a hex-encoded string.  This is done here to
 		// avoid deserializing it only to reserialize it again later.
 		if !verbose {
-			return hex.EncodeToString(txBytes), nil
+			return hex.EncodeToString(originalTxBytes), nil
 		}
 
 		// Grab the block details.
@@ -2966,9 +3341,22 @@ func handleGetRawTransaction(_ context.Context, s *Server, cmd interface{}) (int
 
 		// Deserialize the transaction
 		var msgTx wire.MsgTx
-		err = msgTx.Deserialize(bytes.NewReader(txBytes))
+		// Try legacy protocol version first for old transaction data
+		err = msgTx.BtcDecode(bytes.NewReader(originalTxBytes), wire.CFilterV2Version)
 		if err != nil {
-			return nil, rpcInternalErr(err, "Failed to deserialize transaction")
+			// Try current protocol version
+			err = msgTx.BtcDecode(bytes.NewReader(originalTxBytes), wire.ProtocolVersion)
+			if err != nil {
+				return nil, rpcInternalErr(err, "Failed to deserialize transaction")
+			}
+			// Already includes CoinType field
+			isLegacyFormat = false
+		} else {
+			// Legacy transaction data - need to add CoinType field
+			for i := range msgTx.TxOut {
+				msgTx.TxOut[i].CoinType = cointype.CoinTypeVAR
+			}
+			isLegacyFormat = true
 		}
 		mtx = &msgTx
 	} else {
@@ -2997,6 +3385,11 @@ func handleGetRawTransaction(_ context.Context, s *Server, cmd interface{}) (int
 		blkHashStr    string
 		confirmations int64
 	)
+
+	// Mempool transactions are always current format
+	if tx != nil {
+		isLegacyFormat = false
+	}
 	if blkHash != nil {
 		// Fetch the header from chain.
 		header, err := chain.HeaderByHash(blkHash)
@@ -3023,9 +3416,17 @@ func handleGetRawTransaction(_ context.Context, s *Server, cmd interface{}) (int
 		return nil, rpcInternalErr(err, "Treasury Status")
 	}
 
-	rawTxn, err := s.createTxRawResult(s.cfg.ChainParams, mtx, txHash.String(),
-		blkIndex, blkHeader, blkHashStr, blkHeight, confirmations,
-		isTreasuryEnabled)
+	var rawTxn *types.TxRawResult
+	if isLegacyFormat {
+		// For legacy transactions, preserve the original hex format
+		rawTxn, err = s.createTxRawResultWithHex(s.cfg.ChainParams, mtx,
+			hex.EncodeToString(originalTxBytes), txHash.String(), blkIndex, blkHeader,
+			blkHashStr, blkHeight, confirmations, isTreasuryEnabled)
+	} else {
+		rawTxn, err = s.createTxRawResult(s.cfg.ChainParams, mtx, txHash.String(),
+			blkIndex, blkHeader, blkHashStr, blkHeight, confirmations,
+			isTreasuryEnabled)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3049,6 +3450,140 @@ func handleGetStakeDifficulty(_ context.Context, s *Server, _ interface{}) (inte
 		NextStakeDifficulty:    dcrutil.Amount(best.NextStakeDiff).ToCoin(),
 	}
 	return result, nil
+}
+
+// handleGetSKAInfo returns information about all configured SKA coin types.
+func handleGetSKAInfo(_ context.Context, s *Server, _ interface{}) (interface{}, error) {
+	chainParams := s.cfg.ChainParams
+
+	result := make([]types.GetSKAInfoResult, 0)
+
+	// Get all configured SKA coin types
+	for coinType, cfg := range chainParams.SKACoins {
+		result = append(result, types.GetSKAInfoResult{
+			CoinType:    uint8(coinType),
+			Name:        cfg.Name,
+			Symbol:      cfg.Symbol,
+			MaxSupply:   cfg.MaxSupply,
+			Active:      cfg.Active,
+			Description: cfg.Description,
+		})
+	}
+
+	// Sort by coin type for consistent output
+	for i := 0; i < len(result)-1; i++ {
+		for j := i + 1; j < len(result); j++ {
+			if result[i].CoinType > result[j].CoinType {
+				result[i], result[j] = result[j], result[i]
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// handleGetEmissionStatus returns the current emission status for a specific SKA coin type.
+func handleGetEmissionStatus(_ context.Context, s *Server, icmd interface{}) (interface{}, error) {
+	c := icmd.(*types.GetEmissionStatusCmd)
+
+	// Validate coin type range
+	coinType := cointype.CoinType(c.CoinType)
+	if coinType < 1 || coinType > 255 {
+		return nil, dcrjson.NewRPCError(dcrjson.ErrRPCInvalidParameter,
+			"coin type must be between 1 and 255 (SKA types)")
+	}
+
+	// Get chain configuration for this coin type
+	chainParams := s.cfg.ChainParams
+	config, exists := chainParams.SKACoins[coinType]
+	if !exists {
+		return nil, dcrjson.NewRPCError(dcrjson.ErrRPCInvalidParameter,
+			fmt.Sprintf("coin type %d is not configured in chain parameters", c.CoinType))
+	}
+
+	// Get current block height
+	best := s.cfg.Chain.BestSnapshot()
+	currentHeight := best.Height
+
+	// Calculate emission window boundaries
+	windowStart := int64(config.EmissionHeight)
+	windowEnd := windowStart + int64(config.EmissionWindow)
+
+	// Determine if emission window is currently active
+	windowActive := currentHeight >= windowStart && currentHeight <= windowEnd
+
+	// Get current nonce from blockchain state (not chain parameters)
+	currentNonce := s.cfg.Chain.GetSKAEmissionNonce(coinType)
+
+	// Check if already emitted by examining blockchain state
+	alreadyEmitted := s.cfg.Chain.HasSKAEmissionOccurred(coinType)
+
+	// Calculate circulating supply (max - burned), 0 if not yet emitted
+	var circulatingSupply int64
+	if alreadyEmitted {
+		burnedAmount := s.cfg.Chain.GetSKABurnedAmount(coinType)
+		circulatingSupply = config.MaxSupply - burnedAmount
+	}
+
+	return types.GetEmissionStatusResult{
+		CoinType:          c.CoinType,
+		EmissionHeight:    windowStart,
+		EmissionWindow:    int64(config.EmissionWindow),
+		CurrentHeight:     currentHeight,
+		WindowActive:      windowActive,
+		WindowStart:       windowStart,
+		WindowEnd:         windowEnd,
+		CurrentNonce:      currentNonce,
+		NextNonce:         currentNonce + 1,
+		AlreadyEmitted:    alreadyEmitted,
+		MaxSupply:         config.MaxSupply,
+		CirculatingSupply: circulatingSupply,
+	}, nil
+}
+
+// handleGetBurnedCoins implements the getburnedcoins JSON-RPC command.
+func handleGetBurnedCoins(_ context.Context, s *Server, icmd interface{}) (interface{}, error) {
+	c := icmd.(*types.GetBurnedCoinsCmd)
+
+	// Get burned amounts from blockchain
+	var burnedAmounts map[cointype.CoinType]int64
+
+	if c.CoinType != nil {
+		// Specific coin type requested
+		coinType := cointype.CoinType(*c.CoinType)
+
+		// Validate coin type is in SKA range (1-255)
+		if !coinType.IsSKA() {
+			return nil, dcrjson.NewRPCError(dcrjson.ErrRPCInvalidParameter,
+				"coin type must be between 1 and 255 (SKA types)")
+		}
+
+		// Get burned amount for this coin type
+		amount := s.cfg.Chain.GetSKABurnedAmount(coinType)
+		burnedAmounts = map[cointype.CoinType]int64{coinType: amount}
+	} else {
+		// Get all burned amounts
+		burnedAmounts = s.cfg.Chain.GetAllSKABurnedAmounts()
+	}
+
+	// Convert to result format
+	stats := make([]types.GetBurnedCoinsStat, 0, len(burnedAmounts))
+	for coinType, amount := range burnedAmounts {
+		// Skip coin types with zero burns (shouldn't happen but be defensive)
+		if amount == 0 {
+			continue
+		}
+
+		stats = append(stats, types.GetBurnedCoinsStat{
+			CoinType:    uint8(coinType),
+			Name:        coinType.String(),
+			TotalBurned: dcrutil.Amount(amount).ToCoinType(coinType),
+		})
+	}
+
+	return types.GetBurnedCoinsResult{
+		Stats: stats,
+	}, nil
 }
 
 // convertVersionMap translates a map[int]int into a sorted array of
@@ -5220,19 +5755,6 @@ func (s *Server) isAutoRevocationsAgendaActive(prevBlkHash *chainhash.Hash) (boo
 	return isAutoRevocationsEnabled, nil
 }
 
-// isSubsidySplitAgendaActive returns if the modified subsidy split agenda is
-// active or not for the block AFTER the provided block hash.
-func (s *Server) isSubsidySplitAgendaActive(prevBlkHash *chainhash.Hash) (bool, error) {
-	chain := s.cfg.Chain
-	isSubsidySplitEnabled, err := chain.IsSubsidySplitAgendaActive(prevBlkHash)
-	if err != nil {
-		context := fmt.Sprintf("Could not obtain modified subsidy split "+
-			"agenda status for block %s", prevBlkHash)
-		return false, rpcInternalErr(err, context)
-	}
-	return isSubsidySplitEnabled, nil
-}
-
 // isBlake3PowAgendaActive returns whether or not the agenda to change the proof
 // of work hash function to blake3 is active or not for the block AFTER the
 // provided block hash.
@@ -5242,19 +5764,6 @@ func (s *Server) isBlake3PowAgendaActive(prevBlkHash *chainhash.Hash) (bool, err
 	if err != nil {
 		context := fmt.Sprintf("Could not obtain blake3 proof of work "+
 			"agenda status for block %s", prevBlkHash)
-		return false, rpcInternalErr(err, context)
-	}
-	return isActive, nil
-}
-
-// isSubsidySplitR2AgendaActive returns if the modified subsidy split round 2
-// agenda is active or not for the block AFTER the provided block hash.
-func (s *Server) isSubsidySplitR2AgendaActive(prevBlkHash *chainhash.Hash) (bool, error) {
-	chain := s.cfg.Chain
-	isActive, err := chain.IsSubsidySplitR2AgendaActive(prevBlkHash)
-	if err != nil {
-		context := fmt.Sprintf("Could not obtain modified subsidy split "+
-			"round 2 agenda status for block %s", prevBlkHash)
 		return false, rpcInternalErr(err, context)
 	}
 	return isActive, nil
@@ -6110,6 +6619,10 @@ type Config struct {
 	// for test purposes when doing regression or simulation testing.
 	BlockTemplater BlockTemplater
 	CPUMiner       CPUMiner
+
+	// CoinTypeFeeCalculator provides access to coin-type-specific fee estimation
+	// and management for the dual-coin system.
+	CoinTypeFeeCalculator CoinTypeFeeCalculator
 
 	// TxIndexer defines the optional transaction indexer for the RPC server to
 	// use.

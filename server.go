@@ -77,7 +77,7 @@ const (
 	connectionRetryInterval = time.Second * 5
 
 	// maxProtocolVersion is the max protocol version the server supports.
-	maxProtocolVersion = wire.BatchedCFiltersV2Version
+	maxProtocolVersion = wire.ProtocolVersion
 
 	// These fields are used to track known addresses on a per-peer basis.
 	//
@@ -353,6 +353,7 @@ type peerState struct {
 	persistentPeers map[int32]*serverPeer
 	banned          map[string]time.Time
 	outboundGroups  map[string]int
+	lastMaxIPLog    map[string]time.Time // tracks last INFO log time per IP
 
 	// subCache houses the network address submission cache and is protected
 	// by its own mutex.
@@ -369,6 +370,7 @@ func makePeerState() peerState {
 		outboundPeers:   make(map[int32]*serverPeer),
 		banned:          make(map[string]time.Time),
 		outboundGroups:  make(map[string]int),
+		lastMaxIPLog:    make(map[string]time.Time),
 		subCache: &naSubmissionCache{
 			cache: make(map[string]*naSubmission, maxCachedNaSubmissions),
 			limit: maxCachedNaSubmissions,
@@ -595,6 +597,7 @@ type server struct {
 	chain                *blockchain.BlockChain
 	txMemPool            *mempool.TxPool
 	feeEstimator         *fees.Estimator
+	feeCalculator        *fees.CoinTypeFeeCalculator // Shared fee calculator for mining and RPC
 	cpuMiner             *cpuminer.CPUMiner
 	mixMsgPool           *mixpool.Pool
 	modifyRebroadcastInv chan interface{}
@@ -614,6 +617,7 @@ type server struct {
 	indexSubscriber *indexers.IndexSubscriber
 	txIndex         *indexers.TxIndex
 	existsAddrIndex *indexers.ExistsAddrIndex
+	ssfeeIndex      *indexers.SSFeeIndex
 
 	// These following fields are used to filter duplicate block lottery data
 	// anouncements.
@@ -2431,8 +2435,15 @@ func (s *server) handleAddPeer(sp *serverPeer) bool {
 	if cfg.MaxSameIP > 0 && !isInboundWhitelisted && !peerIP.IsLoopback() &&
 		state.connectionsWithIP(peerIP)+1 > cfg.MaxSameIP {
 
-		srvrLog.Infof("Max connections with %s reached [%d] - disconnecting "+
-			"peer", sp, cfg.MaxSameIP)
+		// Rate-limit logging: INFO once per IP per 10 minutes, DEBUG otherwise
+		ipStr := peerIP.String()
+		now := time.Now()
+		if lastLog, exists := state.lastMaxIPLog[ipStr]; !exists || now.Sub(lastLog) > 10*time.Minute {
+			state.lastMaxIPLog[ipStr] = now
+			srvrLog.Infof("Max connections with %s reached [%d] - disconnecting peer", sp, cfg.MaxSameIP)
+		} else {
+			srvrLog.Debugf("Max connections with %s reached [%d] - disconnecting peer", sp, cfg.MaxSameIP)
+		}
 		sp.Disconnect()
 		return false
 	}
@@ -2894,6 +2905,11 @@ func (s *server) handleBlockchainNotification(notification *blockchain.Notificat
 		// estimator of the txs that are leaving
 		s.feeEstimator.ProcessBlock(block)
 
+		// Record confirmed transactions in the dual-coin fee calculator
+		// This must be done before removing transactions from the mempool
+		// so we can access the original coin type and fee information
+		s.txMemPool.ProcessConfirmedTransactions(block, isTreasuryEnabled)
+
 		// TODO: In the case the new tip disapproves the previous block, any
 		// transactions the previous block contains in its regular tree which
 		// double spend the same inputs as transactions in either tree of the
@@ -2921,6 +2937,19 @@ func (s *server) handleBlockchainNotification(notification *blockchain.Notificat
 		txMemPool := s.txMemPool
 		handleConnectedBlockTxns := func(txns []*dcrutil.Tx) {
 			for _, tx := range txns {
+				// Skip SKA emission transactions similar to how we skip coinbase.
+				// SKA emissions create new coins and don't belong in the mempool
+				// after being mined, just like coinbase transactions.
+				if wire.IsSKAEmissionTransaction(tx.MsgTx()) {
+					// Remove it from mempool if it exists (it might have been submitted via RPC)
+					// Unlike coinbase which never exists in mempool, SKA emissions can be
+					// submitted to mempool before being mined.
+					txMemPool.RemoveTransaction(tx, false)
+					// Still mark it as confirmed for tracking purposes
+					s.TransactionConfirmed(tx)
+					continue
+				}
+
 				txMemPool.RemoveTransaction(tx, false)
 				txMemPool.MaybeAcceptDependents(tx, isTreasuryEnabled)
 				txMemPool.RemoveDoubleSpends(tx)
@@ -3902,6 +3931,10 @@ func newServer(ctx context.Context, profiler *profileServer,
 	}
 	s.feeEstimator = fe
 
+	// Create shared fee calculator for dual-coin system
+	// This single instance is used by both mining and RPC to ensure consistent fee estimates
+	s.feeCalculator = fees.NewCoinTypeFeeCalculator(chainParams, cfg.minRelayTxFee)
+
 	if cfg.AllowOldForks {
 		srvrLog.Info("Processing forks deep in history is enabled")
 	}
@@ -3966,6 +3999,16 @@ func newServer(ctx context.Context, profiler *profileServer,
 			return nil, err
 		}
 	}
+
+	// SSFee index is always enabled to support UTXO consolidation.
+	// This index tracks SSFee outputs by (coinType, address) for efficient
+	// UTXO lookup during block template generation.
+	indxLog.Info("SSFee UTXO index is enabled")
+	s.ssfeeIndex, err = indexers.NewSSFeeIndex(s.indexSubscriber, db, queryer)
+	if err != nil {
+		return nil, err
+	}
+
 	err = s.indexSubscriber.CatchUp(ctx, s.db, queryer)
 	if err != nil {
 		return nil, err
@@ -4040,6 +4083,12 @@ func newServer(ctx context.Context, profiler *profileServer,
 			tipHash := &s.chain.BestSnapshot().Hash
 			return s.chain.IsSubsidySplitR2AgendaActive(tipHash)
 		},
+		// Add SKA emission state checks for mempool protection
+		HasSKAEmissionOccurred: s.chain.HasSKAEmissionOccurred,
+		GetSKAEmissionNonce:    s.chain.GetSKAEmissionNonce,
+		HasVotePassedAtHeight: func(voteID string, height int64) bool {
+			return s.chain.HasVotePassedAtHeight(voteID, height)
+		},
 		TSpendMinedOnAncestor: func(tspend chainhash.Hash) error {
 			tipHash := s.chain.BestSnapshot().Hash
 			return s.chain.CheckTSpendExists(tipHash, tspend)
@@ -4095,6 +4144,8 @@ func newServer(ctx context.Context, profiler *profileServer,
 			TimeSource:                 s.timeSource,
 			SubsidyCache:               s.subsidyCache,
 			ChainParams:                s.chainParams,
+			FeeCalculator:              s.feeCalculator, // Use shared fee calculator
+			SSFeeIndex:                 s.ssfeeIndex,    // Enable SSFee UTXO augmentation
 			MiningTimeOffset:           cfg.MiningTimeOffset,
 			BestSnapshot:               s.chain.BestSnapshot,
 			BlockByHash:                s.chain.BlockByHash,
@@ -4148,7 +4199,7 @@ func newServer(ctx context.Context, profiler *profileServer,
 
 		s.cpuMiner = cpuminer.New(&cpuminer.Config{
 			ChainParams:                s.chainParams,
-			PermitConnectionlessMining: cfg.SimNet || cfg.RegNet,
+			PermitConnectionlessMining: cfg.SimNet || cfg.RegNet || cfg.Generate,
 			BgBlkTmplGenerator:         s.bg,
 			ProcessBlock:               s.syncManager.ProcessBlock,
 			ConnectedCount:             s.ConnectedCount,
@@ -4259,18 +4310,19 @@ func newServer(ctx context.Context, profiler *profileServer,
 		}
 
 		rpcsConfig := rpcserver.Config{
-			Listeners:    rpcListeners,
-			ProfilerMgr:  profiler,
-			ConnMgr:      &rpcConnManager{&s},
-			SyncMgr:      &rpcSyncMgr{server: &s, syncMgr: s.syncManager},
-			FeeEstimator: s.feeEstimator,
-			TimeSource:   s.timeSource,
-			Services:     s.services,
-			AddrManager:  s.addrManager,
-			Clock:        &rpcClock{},
-			SubsidyCache: s.subsidyCache,
-			Chain:        &rpcChain{s.chain},
-			ChainParams:  chainParams,
+			Listeners:             rpcListeners,
+			ProfilerMgr:           profiler,
+			ConnMgr:               &rpcConnManager{&s},
+			SyncMgr:               &rpcSyncMgr{server: &s, syncMgr: s.syncManager},
+			FeeEstimator:          s.feeEstimator,
+			CoinTypeFeeCalculator: &rpcCoinTypeFeeCalculator{s.feeCalculator}, // Use shared fee calculator
+			TimeSource:            s.timeSource,
+			Services:              s.services,
+			AddrManager:           s.addrManager,
+			Clock:                 &rpcClock{},
+			SubsidyCache:          s.subsidyCache,
+			Chain:                 &rpcChain{s.chain},
+			ChainParams:           chainParams,
 			SanityChecker: &rpcSanityChecker{
 				chain:       s.chain,
 				timeSource:  s.timeSource,

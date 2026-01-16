@@ -14,6 +14,7 @@ import (
 	"github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4"
@@ -59,8 +60,8 @@ func TestCalcMinRequiredTxRelayFee(t *testing.T) {
 		{
 			"max standard tx size with max relay fee",
 			MaxStandardTxSize,
-			dcrutil.MaxAmount,
-			dcrutil.MaxAmount,
+			dcrutil.Amount(cointype.MaxVARAmount),
+			int64(cointype.MaxVARAmount),
 		},
 		{
 			"1500 bytes with 5000 relay fee",
@@ -223,64 +224,64 @@ func TestDust(t *testing.T) {
 		{
 			// Any value is allowed with a zero relay fee.
 			"zero value with zero relay fee",
-			wire.TxOut{Value: 0, Version: 0, PkScript: pkScript},
+			wire.TxOut{Value: 0, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			0,
 			true,
 		},
 		{
 			// Zero value is dust with any relay fee"
 			"zero value with very small tx fee",
-			wire.TxOut{Value: 0, Version: 0, PkScript: pkScript},
+			wire.TxOut{Value: 0, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1,
 			true,
 		},
 		{
 			"25 byte public key script with value 602, relay fee 1e3",
-			wire.TxOut{Value: 602, Version: 0, PkScript: pkScript},
+			wire.TxOut{Value: 602, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1000,
 			true,
 		},
 		{
-			"25 byte public key script with value 603, relay fee 1e3",
-			wire.TxOut{Value: 603, Version: 0, PkScript: pkScript},
+			"25 byte public key script with value 606, relay fee 1e3",
+			wire.TxOut{Value: 606, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1000,
 			false,
 		},
 		{
 			"25 byte public key script with value 60299, relay fee 1e5",
-			wire.TxOut{Value: 60299, Version: 0, PkScript: pkScript},
+			wire.TxOut{Value: 60299, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1e5,
 			true,
 		},
 		{
-			"25 byte public key script with value 60300, relay fee 1e5",
-			wire.TxOut{Value: 60300, Version: 0, PkScript: pkScript},
+			"25 byte public key script with value 60601, relay fee 1e5",
+			wire.TxOut{Value: 60601, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1e5,
 			false,
 		},
 		{
 			"25 byte public key script with value 6029, relay fee 1e4",
-			wire.TxOut{Value: 6029, Version: 0, PkScript: pkScript},
+			wire.TxOut{Value: 6029, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1e4,
 			true,
 		},
 		{
-			"25 byte public key script with value 6030, relay fee 1e4",
-			wire.TxOut{Value: 6030, Version: 0, PkScript: pkScript},
+			"25 byte public key script with value 6061, relay fee 1e4",
+			wire.TxOut{Value: 6061, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1e4,
 			false,
 		},
 		{
 			// Maximum allowed value is never dust.
 			"max amount is never dust",
-			wire.TxOut{Value: dcrutil.MaxAmount, Version: 0, PkScript: pkScript},
-			dcrutil.MaxAmount,
+			wire.TxOut{Value: int64(cointype.MaxVARAmount), Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
+			dcrutil.Amount(cointype.MaxVARAmount),
 			false,
 		},
 		{
 			// Maximum int64 value causes overflow.
 			"maximum int64 value",
-			wire.TxOut{Value: 1<<63 - 1, Version: 0, PkScript: pkScript},
+			wire.TxOut{Value: 1<<63 - 1, Version: 0, PkScript: pkScript, CoinType: cointype.CoinTypeVAR},
 			1<<63 - 1,
 			true,
 		},
@@ -288,9 +289,24 @@ func TestDust(t *testing.T) {
 			// Unspendable pkScript due to an invalid public key
 			// script.
 			"unspendable pkScript",
-			wire.TxOut{Value: 5000, Version: 0, PkScript: []byte{0x01}},
+			wire.TxOut{Value: 5000, Version: 0, PkScript: []byte{0x01}, CoinType: cointype.CoinTypeVAR},
 			0, // no relay fee
 			true,
+		},
+		{
+			// SKA burn script with large value should NOT be dust.
+			// Burn scripts are intentionally unspendable but valid.
+			"SKA burn script with large value is not dust",
+			wire.TxOut{Value: 800000050000000, Version: 0, PkScript: stdscript.NewSKABurnScriptV0(1), CoinType: cointype.CoinType(1)},
+			1e4,
+			false,
+		},
+		{
+			// SKA burn script with small value should NOT be dust.
+			"SKA burn script with small value is not dust",
+			wire.TxOut{Value: 1, Version: 0, PkScript: stdscript.NewSKABurnScriptV0(255), CoinType: cointype.CoinType(255)},
+			1e4,
+			false,
 		},
 	}
 	for _, test := range tests {
@@ -330,6 +346,7 @@ func TestCheckTransactionStandard(t *testing.T) {
 		Value:    100000000, // 1 BTC
 		Version:  dummyPkScriptVer,
 		PkScript: dummyPkScript,
+		CoinType: cointype.CoinTypeVAR,
 	}
 
 	tests := []struct {
@@ -391,6 +408,7 @@ func TestCheckTransactionStandard(t *testing.T) {
 					Value: 0,
 					PkScript: bytes.Repeat([]byte{0x00},
 						MaxStandardTxSize+1),
+					CoinType: cointype.CoinTypeVAR,
 				}},
 				LockTime: 0,
 			},
@@ -443,6 +461,7 @@ func TestCheckTransactionStandard(t *testing.T) {
 				TxOut: []*wire.TxOut{{
 					Value:    100000000,
 					PkScript: []byte{txscript.OP_TRUE},
+					CoinType: cointype.CoinTypeVAR,
 				}},
 				LockTime: 0,
 			},
@@ -459,15 +478,19 @@ func TestCheckTransactionStandard(t *testing.T) {
 				TxOut: []*wire.TxOut{{
 					Value:    0,
 					PkScript: []byte{txscript.OP_RETURN},
+					CoinType: cointype.CoinTypeVAR,
 				}, {
 					Value:    0,
 					PkScript: []byte{txscript.OP_RETURN},
+					CoinType: cointype.CoinTypeVAR,
 				}, {
 					Value:    0,
 					PkScript: []byte{txscript.OP_RETURN},
+					CoinType: cointype.CoinTypeVAR,
 				}, {
 					Value:    0,
 					PkScript: []byte{txscript.OP_RETURN},
+					CoinType: cointype.CoinTypeVAR,
 				}, {
 					Value:    0,
 					PkScript: []byte{txscript.OP_RETURN},

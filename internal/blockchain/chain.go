@@ -22,6 +22,7 @@ import (
 	"github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/container/lru"
 	"github.com/decred/dcrd/database/v3"
 	"github.com/decred/dcrd/dcrutil/v4"
@@ -182,6 +183,14 @@ type BlockChain struct {
 	// subsidyCache is the cache that provides quick lookup of subsidy
 	// values.
 	subsidyCache *standalone.SubsidyCache
+
+	// skaEmissionState manages the persistent state for SKA emissions
+	// including nonces and emission tracking for security.
+	skaEmissionState *SKAEmissionState
+
+	// skaBurnState manages the persistent state for SKA burns
+	// tracking the total amount burned per coin type.
+	skaBurnState *SKABurnState
 
 	// processLock protects concurrent access to overall chain processing
 	// independent from the chain lock which is periodically released to
@@ -715,6 +724,32 @@ func (b *BlockChain) connectBlock(node *blockNode, block, parent *dcrutil.Block,
 			return err
 		}
 
+		// Update SKA emission state for any emissions in this block.
+		// This must be done atomically with the block connection to ensure
+		// consistency in case of crashes or interruptions.
+		if b.skaEmissionState != nil {
+			emissions := extractSKAEmissionsFromBlock(block, node.height)
+			if len(emissions) > 0 {
+				err = b.skaEmissionState.ConnectSKAEmissionsTx(dbTx, emissions)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		// Update SKA burn state for any burns in this block.
+		// This must be done atomically with the block connection to ensure
+		// consistency in case of crashes or interruptions.
+		if b.skaBurnState != nil {
+			burns := extractSKABurnsFromBlock(block, node.height, b.chainParams)
+			if len(burns) > 0 {
+				err = b.skaBurnState.ConnectSKABurnsTx(dbTx, burns)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -889,6 +924,32 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block, parent *dcrutil.Blo
 		// inclusion proof for the header commitment are not removed for the
 		// same reason.
 
+		// Update SKA emission state for any emissions in the disconnected block.
+		// This must be done atomically with the block disconnection to ensure
+		// consistency during reorganizations.
+		if b.skaEmissionState != nil {
+			emissions := extractSKAEmissionsFromBlock(block, node.height)
+			if len(emissions) > 0 {
+				err = b.skaEmissionState.DisconnectSKAEmissionsTx(dbTx, emissions)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		// Update SKA burn state for any burns in the disconnected block.
+		// This must be done atomically with the block disconnection to ensure
+		// consistency during reorganizations.
+		if b.skaBurnState != nil {
+			burns := extractSKABurnsFromBlock(block, node.height, b.chainParams)
+			if len(burns) > 0 {
+				err = b.skaBurnState.DisconnectSKABurnsTx(dbTx, burns)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -957,6 +1018,10 @@ func countSpentRegularOutputs(block *dcrutil.Block) int {
 	// Skip the coinbase since it has no inputs.
 	var numSpent int
 	for _, tx := range block.MsgBlock().Transactions[1:] {
+		// Skip SKA emission transactions since they have null inputs (similar to coinbase).
+		if wire.IsSKAEmissionTransaction(tx) {
+			continue
+		}
 		numSpent += len(tx.TxIn)
 	}
 	return numSpent
@@ -973,10 +1038,18 @@ func countSpentStakeOutputs(block *dcrutil.Block) int {
 			continue
 		}
 
-		// Exclude treasurybase and treasury spends since neither have any
-		// inputs.
+		// Exclude treasurybase and treasury spends since they have no real inputs.
 		if stake.IsTreasuryBase(stx) || stake.IsTSpend(stx) {
 			continue
+		}
+
+		// For SSFee, only skip null-input SSFee (creates new UTXO from scratch).
+		// Augmented SSFee (real input) spends a previous SSFee output and must be counted.
+		if stake.DetermineTxType(stx) == stake.TxTypeSSFee {
+			if len(stx.TxIn) > 0 && stx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex {
+				continue // Null-input SSFee - no inputs to count
+			}
+			// Augmented SSFee - fall through to count its input
 		}
 
 		numSpent += len(stx.TxIn)
@@ -1620,6 +1693,51 @@ func (b *BlockChain) BestSnapshot() *BestState {
 	return snapshot
 }
 
+// GetSKAEmissionNonce returns the last used nonce for the specified coin type.
+// This replaces the old chainParams-based nonce storage with proper blockchain
+// state management for security and reorg handling.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) GetSKAEmissionNonce(coinType cointype.CoinType) uint64 {
+	if b.skaEmissionState == nil {
+		return 0
+	}
+	return b.skaEmissionState.GetNonce(coinType)
+}
+
+// HasSKAEmissionOccurred checks if an emission has already occurred for the
+// specified coin type. This is used to prevent duplicate emissions.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) HasSKAEmissionOccurred(coinType cointype.CoinType) bool {
+	if b.skaEmissionState == nil {
+		return false
+	}
+	return b.skaEmissionState.IsEmitted(coinType)
+}
+
+// GetSKABurnedAmount returns the total amount burned for the specified SKA coin type.
+// Returns 0 if no burns have occurred for this coin type.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) GetSKABurnedAmount(coinType cointype.CoinType) int64 {
+	if b.skaBurnState == nil {
+		return 0
+	}
+	return b.skaBurnState.GetBurnedAmount(coinType)
+}
+
+// GetAllSKABurnedAmounts returns a map of all SKA coin types to their total burned amounts.
+// Only coin types with non-zero burned amounts are included in the result.
+//
+// This function is safe for concurrent access.
+func (b *BlockChain) GetAllSKABurnedAmounts() map[cointype.CoinType]int64 {
+	if b.skaBurnState == nil {
+		return make(map[cointype.CoinType]int64)
+	}
+	return b.skaBurnState.GetAllBurnedAmounts()
+}
+
 // maxBlockSize returns the maximum permitted block size for the block
 // AFTER the given node.
 //
@@ -2212,8 +2330,23 @@ func extractDeployments(params *chaincfg.Params) (map[string]deploymentInfo, err
 				return nil, err
 			}
 
-			// Prevent forced choices on the main network.
-			if isMainNet(params) && forcedState != nil {
+			// Prevent forced choices on the main network, except for legacy
+			// deployments that need early activation on Monetarium mainnet.
+			// These exceptions allow DCP0001 (stake difficulty), DCP0002 (OP_SHA256),
+			// and DCP0003 (CSV/LN features) to be forced active without voting.
+			// Technical upgrades like DCP0004, DCP0005, DCP0008, DCP0009, DCP0010,
+			// and DCP0011 (BLAKE3) are also allowed to be forced active on Monetarium
+			// mainnet.
+			legacyDeployments := map[string]bool{
+				chaincfg.VoteIDSDiffAlgorithm:          true, // DCP0001
+				chaincfg.VoteIDLNFeatures:              true, // DCP0002 & DCP0003
+				chaincfg.VoteIDFixLNSeqLocks:           true, // DCP0004
+				chaincfg.VoteIDHeaderCommitments:       true, // DCP0005
+				chaincfg.VoteIDExplicitVersionUpgrades: true, // DCP0008
+				chaincfg.VoteIDAutoRevocations:         true, // DCP0009
+				chaincfg.VoteIDBlake3Pow:               true, // DCP0011
+			}
+			if isMainNet(params) && forcedState != nil && !legacyDeployments[id] {
 				str := fmt.Sprintf("deployment ID %s has a forced choice for "+
 					"the main network", id)
 				return nil, contextError(ErrForcedMainNetChoice, str)
@@ -2253,6 +2386,49 @@ func (q *ChainQueryerAdapter) BestHeight() int64 {
 // provided block.
 func (q *ChainQueryerAdapter) IsTreasuryEnabled(hash *chainhash.Hash) (bool, error) {
 	return q.IsTreasuryAgendaActive(hash)
+}
+
+// FetchUtxoEntryAmount returns the amount of the specified unspent transaction
+// output and whether it is spent from the point of view of the main chain tip.
+// Returns (amount=0, spent=true) if the UTXO doesn't exist or is spent.
+// Returns (amount>0, spent=false) if the UTXO exists and is unspent.
+//
+// This is part of the indexers.ChainQueryer interface.
+func (q *ChainQueryerAdapter) FetchUtxoEntryAmount(outpoint wire.OutPoint) (int64, bool, error) {
+	entry, err := q.FetchUtxoEntry(outpoint)
+	if err != nil {
+		return 0, true, err
+	}
+
+	// If entry is nil or is spent, return spent=true
+	if entry == nil || entry.IsSpent() {
+		return 0, true, nil
+	}
+
+	// Return the amount and spent=false for unspent UTXOs
+	return entry.Amount(), false, nil
+}
+
+// FetchUtxoEntryDetails returns the amount, block height, and block index
+// of the specified unspent transaction output from the point of view of the
+// main chain tip. This is used for fraud proof data when creating transactions.
+// Returns (amount=0, height=0, index=0, spent=true) if the UTXO doesn't exist or is spent.
+// Returns (amount>0, height>0, index>=0, spent=false) if the UTXO exists and is unspent.
+//
+// This is part of the indexers.ChainQueryer interface.
+func (q *ChainQueryerAdapter) FetchUtxoEntryDetails(outpoint wire.OutPoint) (int64, int64, uint32, bool, error) {
+	entry, err := q.FetchUtxoEntry(outpoint)
+	if err != nil {
+		return 0, 0, 0, true, err
+	}
+
+	// If entry is nil or is spent, return spent=true
+	if entry == nil || entry.IsSpent() {
+		return 0, 0, 0, true, nil
+	}
+
+	// Return the amount, block height, block index, and spent=false for unspent UTXOs
+	return entry.Amount(), entry.BlockHeight(), entry.BlockIndex(), false, nil
 }
 
 // isTestNet3 returns whether or not the chain instance is for version 3 of the
@@ -2464,6 +2640,33 @@ func New(ctx context.Context, config *Config) (*BlockChain, error) {
 		utxoCache:                     config.UtxoCache,
 	}
 	b.pruner = newChainPruner(&b)
+
+	// Validate SKA emission parameters
+	// Ensure all SKA emissions happen after stake validation is active
+	for coinType, skaConfig := range params.SKACoins {
+		if skaConfig.EmissionHeight > 0 && int64(skaConfig.EmissionHeight) < params.StakeValidationHeight {
+			return nil, fmt.Errorf("SKA coin type %d emission height %d is before stake validation height %d",
+				coinType, skaConfig.EmissionHeight, params.StakeValidationHeight)
+		}
+	}
+
+	// Initialize the SKA emission state for tracking nonces and emissions.
+	// This must be done before chain state initialization as it may be
+	// referenced during block validation.
+	skaState, err := NewSKAEmissionState(config.DB)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize SKA emission state: %w", err)
+	}
+	b.skaEmissionState = skaState
+
+	// Initialize the SKA burn state for tracking total burned amounts per coin type.
+	// This must be done before chain state initialization as it may be
+	// referenced during block connection/disconnection.
+	skaBurnState, err := NewSKABurnState(config.DB)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize SKA burn state: %w", err)
+	}
+	b.skaBurnState = skaBurnState
 
 	// Initialize the chain state from the passed database.  When the db
 	// does not yet contain any chain state, both it and the chain state

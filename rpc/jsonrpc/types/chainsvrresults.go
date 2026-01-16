@@ -34,6 +34,50 @@ type EstimateSmartFeeResult struct {
 	Blocks  int64    `json:"blocks"`
 }
 
+// GetFeeResult models the data returned from the getfeestimatesbycointype
+// command.
+type GetFeeResult struct {
+	CoinType             uint8    `json:"cointype"`
+	MinRelayFee          float64  `json:"minrelayfee"`
+	DynamicFeeMultiplier float64  `json:"dynamicfeemultiplier"`
+	FastFee              float64  `json:"fastfee"`   // ~1 block (90th percentile)
+	NormalFee            float64  `json:"normalfee"` // ~3 blocks (50th percentile)
+	SlowFee              float64  `json:"slowfee"`   // ~6 blocks (10th percentile)
+	PendingTxCount       int      `json:"pendingtxcount"`
+	PendingTxSize        int64    `json:"pendingtxsize"`
+	BlockSpaceUsed       float64  `json:"blockspaceused"`
+	LastUpdated          int64    `json:"lastupdated"`
+	Errors               []string `json:"errors,omitempty"`
+}
+
+// GetMempoolFeesInfoResult models the data returned from the getmempoolfeesinfo command.
+type GetMempoolFeesInfoResult struct {
+	CoinTypes    map[string]MempoolCoinTypeFeeInfo `json:"cointypes"`    // Keyed by coin type string
+	TotalTxCount int                               `json:"totaltxcount"` // Total transactions across all coin types
+	TotalSize    int64                             `json:"totalsize"`    // Total size across all coin types
+	LastUpdated  int64                             `json:"lastupdated"`  // Unix timestamp
+}
+
+// MempoolCoinTypeFeeInfo contains detailed mempool fee information for a specific coin type.
+type MempoolCoinTypeFeeInfo struct {
+	CoinType        uint8   `json:"cointype"`
+	Name            string  `json:"name"`            // E.g., "VAR", "SKA-1", "SKA-2"
+	TxCount         int     `json:"txcount"`         // Number of transactions in mempool
+	TotalSize       int64   `json:"totalsize"`       // Total size of transactions (bytes)
+	AverageSize     float64 `json:"averagesize"`     // Average transaction size
+	MinFee          float64 `json:"minfee"`          // Minimum fee rate (DCR/KB)
+	MaxFee          float64 `json:"maxfee"`          // Maximum fee rate (DCR/KB)
+	AverageFee      float64 `json:"averagefee"`      // Average fee rate (DCR/KB)
+	MedianFee       float64 `json:"medianfee"`       // Median fee rate (DCR/KB)
+	P25Fee          float64 `json:"p25fee"`          // 25th percentile fee rate
+	P75Fee          float64 `json:"p75fee"`          // 75th percentile fee rate
+	P90Fee          float64 `json:"p90fee"`          // 90th percentile fee rate
+	TotalFees       float64 `json:"totalfees"`       // Total fees for all transactions (DCR)
+	OldestTxTime    int64   `json:"oldesttxtime"`    // Unix timestamp of oldest transaction
+	NewestTxTime    int64   `json:"newesttxtime"`    // Unix timestamp of newest transaction
+	UtilizationRate float64 `json:"utilizationrate"` // Percentage of allocated block space used
+}
+
 // EstimateStakeDiffResult models the data returned from the estimatestakediff
 // command.
 type EstimateStakeDiffResult struct {
@@ -171,6 +215,46 @@ type GetBlockSubsidyResult struct {
 	PoS       int64 `json:"pos"`
 	PoW       int64 `json:"pow"`
 	Total     int64 `json:"total"`
+}
+
+// GetSKAInfoResult models the data returned from the getskainfo command.
+type GetSKAInfoResult struct {
+	CoinType    uint8  `json:"cointype"`
+	Name        string `json:"name"`
+	Symbol      string `json:"symbol"`
+	MaxSupply   int64  `json:"maxsupply"`
+	Active      bool   `json:"active"`
+	Description string `json:"description"`
+}
+
+// GetEmissionStatusResult models the data returned from the getemissionstatus command.
+type GetEmissionStatusResult struct {
+	CoinType          uint8  `json:"cointype"`          // SKA coin type (1-255)
+	EmissionHeight    int64  `json:"emissionheight"`    // Start of emission window
+	EmissionWindow    int64  `json:"emissionwindow"`    // Window size in blocks
+	CurrentHeight     int64  `json:"currentheight"`     // Current block height
+	WindowActive      bool   `json:"windowactive"`      // Is emission window currently active
+	WindowStart       int64  `json:"windowstart"`       // Emission window start height
+	WindowEnd         int64  `json:"windowend"`         // Emission window end height
+	CurrentNonce      uint64 `json:"currentnonce"`      // Last used nonce for replay protection
+	NextNonce         uint64 `json:"nextnonce"`         // Required nonce for next emission
+	AlreadyEmitted    bool   `json:"alreadyemitted"`    // Has this coin type been emitted
+	MaxSupply         int64  `json:"maxsupply"`         // Maximum supply for this coin type in atoms
+	CirculatingSupply int64  `json:"circulatingsupply"` // Current circulating supply in atoms (max - burned)
+}
+
+// GetBurnedCoinsStat models burn statistics for a single coin type.
+type GetBurnedCoinsStat struct {
+	CoinType    uint8   `json:"cointype"`    // Coin type (1-255 for SKA)
+	Name        string  `json:"name"`        // Coin name (e.g., "SKA-1")
+	TotalBurned float64 `json:"totalburned"` // Total amount burned in coins
+}
+
+// GetBurnedCoinsResult models the data returned from the getburnedcoins command.
+// When CoinType is specified, returns a single stat.
+// When CoinType is null, returns stats for all coin types with burns.
+type GetBurnedCoinsResult struct {
+	Stats []GetBurnedCoinsStat `json:"stats"` // Burn statistics by coin type
 }
 
 // GetChainTipsResult models the data returns from the getchaintips command.
@@ -719,5 +803,6 @@ type Vout struct {
 	Value        float64            `json:"value"`
 	N            uint32             `json:"n"`
 	Version      uint16             `json:"version"`
+	CoinType     uint8              `json:"cointype"`
 	ScriptPubKey ScriptPubKeyResult `json:"scriptPubKey"`
 }

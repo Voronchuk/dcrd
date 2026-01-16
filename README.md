@@ -12,7 +12,7 @@ Decred is a blockchain-based cryptocurrency with a strong focus on community
 input, open governance, and sustainable funding for development. It utilizes a
 hybrid proof-of-work and proof-of-stake mining system to ensure that a small
 group cannot dominate the flow of transactions or make changes to Decred without
-the input of the community.  A unit of the currency is called a `decred` (DCR).
+the input of the community.  A unit of the currency is called a `decred` (VAR).
 
 https://decred.org
 
@@ -225,12 +225,3 @@ https://decred.org/community/
 
 The [integrated github issue tracker](https://github.com/decred/dcrd/issues)
 is used for this project.
-
-## Documentation
-
-The documentation for dcrd is a work-in-progress.  It is located in the
-[docs](https://github.com/decred/dcrd/tree/master/docs) folder.
-
-## License
-
-dcrd is licensed under the [copyfree](http://copyfree.org) ISC License.

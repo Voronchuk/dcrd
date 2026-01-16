@@ -10,6 +10,7 @@ import (
 	"math"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -23,15 +24,19 @@ const (
 	opTSpend = 0xc2
 	opTGen   = 0xc3
 
-	// These constants are defined here to avoid a dependency on dcrutil.  They
-	// are used in consensus code which can't be changed without a vote anyway,
-	// so not referring to them directly via dcrutil is safe.
+	// These constants use values from cointype package for consistency.
+	// They are used in consensus code which can't be changed without a vote anyway.
 	//
 	// atomsPerCoin is the number of atoms in one coin.
 	//
 	// maxAtoms is the maximum transaction amount allowed in atoms.
-	atomsPerCoin = 1e8
-	maxAtoms     = 21e6 * atomsPerCoin
+	atomsPerCoin = cointype.AtomsPerVAR
+	maxAtoms     = cointype.MaxVARAtoms
+
+	// Dual-coin support constants
+	// atomsPerSKA is the number of atoms in one SKA coin.
+	atomsPerSKA = cointype.AtomsPerSKA
+	maxSKAAtoms = cointype.MaxSKAAtoms
 )
 
 var (
@@ -40,6 +45,28 @@ var (
 	// time a check is needed.
 	zeroHash = chainhash.Hash{}
 )
+
+// isValidCoinType checks if the given coin type is within valid range.
+// Note: This only validates range (0-255). For activation-aware validation,
+// use the cointype package with chain parameters.
+func isValidCoinType(_ cointype.CoinType) bool {
+	// Valid range is 0-255 (enforced by uint8, but explicit for clarity)
+	return true // All uint8 values (0-255) are valid coin type numbers
+}
+
+// getMaxAtomsForCoinType returns the maximum atoms allowed for a given coin type.
+func getMaxAtomsForCoinType(coinType cointype.CoinType) int64 {
+	switch coinType {
+	case cointype.CoinTypeVAR:
+		return maxAtoms
+	default:
+		// All SKA coin types (1-255) have the same max atoms
+		if coinType >= 1 {
+			return maxSKAAtoms
+		}
+		return 0
+	}
+}
 
 // IsCoinBaseTx determines whether or not a transaction is a coinbase.  A
 // coinbase is a special transaction created by miners that has no inputs.
@@ -97,6 +124,27 @@ func IsCoinBaseTx(tx *wire.MsgTx, isTreasuryEnabled bool) bool {
 	// treasury agenda is active.
 	if isTreasuryEnabled && isTreasurySpendLike(tx) {
 		return false
+	}
+
+	// Avoid detecting SSFee transactions as coinbase.
+	// SSFee transactions have an OP_RETURN output with "SF" or "MF" marker bytes.
+	if tx.Version >= 3 && len(tx.TxOut) >= 2 && len(tx.TxIn[0].SignatureScript) == 0 {
+		// Check for SSFee marker in any OP_RETURN output
+		for _, out := range tx.TxOut {
+			if IsSSFeeMarkerScript(out.PkScript) {
+				return false // This is SSFee, not coinbase
+			}
+		}
+	}
+
+	// Avoid detecting SKA emission transactions as coinbase.
+	// SKA emissions have a signature script starting with [0x01][0x53][0x4B][0x41] marker.
+	if len(tx.TxIn[0].SignatureScript) >= 4 {
+		sigScript := tx.TxIn[0].SignatureScript
+		// SKA marker: 0x01 (length) + "SKA" (0x53 0x4B 0x41)
+		if sigScript[0] == 0x01 && sigScript[1] == 0x53 && sigScript[2] == 0x4B && sigScript[3] == 0x41 {
+			return false // This is SKA emission, not coinbase
+		}
 	}
 
 	return true
@@ -167,35 +215,66 @@ func CheckTransactionSanity(tx *wire.MsgTx, maxTxSize uint64) error {
 	// must not be negative or more than the max allowed per transaction.  Also,
 	// the total of all outputs must abide by the same restrictions.  All
 	// amounts in a transaction are in a unit value known as an atom.  One
-	// Decred is a quantity of atoms as defined by the AtomsPerCoin constant.
-	var totalAtoms int64
+	// coin is a quantity of atoms as defined by the AtomsPerCoin constant.
+	var totalVARAtoms, totalSKAAtoms int64
 	for _, txOut := range tx.TxOut {
 		atoms := txOut.Value
+		coinType := cointype.CoinType(uint8(txOut.CoinType))
+
+		// Validate coin type
+		if !isValidCoinType(coinType) {
+			str := fmt.Sprintf("transaction output has invalid coin type %d", coinType)
+			return ruleError(ErrBadTxOutValue, str)
+		}
+
+		// Validate amount is non-negative
 		if atoms < 0 {
 			str := fmt.Sprintf("transaction output has negative value of %v",
 				atoms)
 			return ruleError(ErrBadTxOutValue, str)
 		}
-		if atoms > maxAtoms {
+
+		// Get max atoms for this coin type
+		maxAtomsForType := getMaxAtomsForCoinType(coinType)
+		if atoms > maxAtomsForType {
 			str := fmt.Sprintf("transaction output value of %v is higher than "+
-				"max allowed value of %v", atoms, maxAtoms)
+				"max allowed value of %v for coin type %d", atoms, maxAtomsForType, coinType)
 			return ruleError(ErrBadTxOutValue, str)
 		}
 
-		// Two's complement int64 overflow guarantees that any overflow is
-		// detected and reported.  This is impossible for Decred, but perhaps
-		// possible if an alt increases the total money supply.
-		totalAtoms += atoms
-		if totalAtoms < 0 {
-			str := fmt.Sprintf("total value of all transaction outputs "+
-				"exceeds max allowed value of %v", maxAtoms)
-			return ruleError(ErrBadTxOutValue, str)
-		}
-		if totalAtoms > maxAtoms {
-			str := fmt.Sprintf("total value of all transaction outputs is %v "+
-				"which is higher than max allowed value of %v", totalAtoms,
-				maxAtoms)
-			return ruleError(ErrBadTxOutValue, str)
+		// Track totals by coin type
+		switch coinType {
+		case cointype.CoinTypeVAR:
+			// Two's complement int64 overflow guarantees that any overflow is
+			// detected and reported.
+			totalVARAtoms += atoms
+			if totalVARAtoms < 0 {
+				str := fmt.Sprintf("total value of all VAR transaction outputs "+
+					"exceeds max allowed value of %v", maxAtoms)
+				return ruleError(ErrBadTxOutValue, str)
+			}
+			if totalVARAtoms > maxAtoms {
+				str := fmt.Sprintf("total value of all VAR transaction outputs is %v "+
+					"which is higher than max allowed value of %v", totalVARAtoms,
+					maxAtoms)
+				return ruleError(ErrBadTxOutValue, str)
+			}
+		default:
+			// All SKA coin types (1-255) use the same validation
+			if coinType >= 1 {
+				totalSKAAtoms += atoms
+				if totalSKAAtoms < 0 {
+					str := fmt.Sprintf("total value of all SKA transaction outputs "+
+						"exceeds max allowed value of %v", maxSKAAtoms)
+					return ruleError(ErrBadTxOutValue, str)
+				}
+				if totalSKAAtoms > maxSKAAtoms {
+					str := fmt.Sprintf("total value of all SKA transaction outputs is %v "+
+						"which is higher than max allowed value of %v", totalSKAAtoms,
+						maxSKAAtoms)
+					return ruleError(ErrBadTxOutValue, str)
+				}
+			}
 		}
 	}
 

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/cointype"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -47,21 +49,17 @@ func TestNet3Params() *Params {
 			SerType: wire.TxSerializeFull,
 			Version: 1,
 			TxIn: []*wire.TxIn{{
-				// Fully null.
 				PreviousOutPoint: wire.OutPoint{
 					Hash:  chainhash.Hash{},
 					Index: 0xffffffff,
-					Tree:  0,
 				},
 				SignatureScript: hexDecode("0000"),
 				Sequence:        0xffffffff,
-				BlockHeight:     wire.NullBlockHeight,
-				BlockIndex:      wire.NullBlockIndex,
-				ValueIn:         wire.NullValueIn,
 			}},
 			TxOut: []*wire.TxOut{{
-				Version: 0x0000,
-				Value:   0x00000000,
+				Value:    0x00000000,
+				CoinType: cointype.CoinTypeVAR,
+				Version:  0x0000,
 				PkScript: hexDecode("801679e98561ada96caec2949a5d41c4cab3851e" +
 					"b740d951c10ecbcf265c1fd9"),
 			}},
@@ -81,11 +79,8 @@ func TestNet3Params() *Params {
 		Name:        "testnet3",
 		Net:         wire.TestNet3,
 		DefaultPort: "19108",
-		DNSSeeds: []DNSSeed{
-			{"testnet-seed.decred.mindcry.org", true},
-			{"testnet-seed.decred.netpurgatory.com", true},
-			{"testnet-seed.decred.org", true},
-		},
+		// DNSSeeds disabled - Monetarium testnet uses manual peer connections
+		DNSSeeds: []DNSSeed{},
 
 		// Chain parameters.
 		//
@@ -114,15 +109,15 @@ func TestNet3Params() *Params {
 		WorkDiffV2HalfLifeSecs:    720, // 6 * TimePerBlock (12 minutes)
 
 		// Subsidy parameters.
-		BaseSubsidy:              2500000000, // 25 Coin
-		MulSubsidy:               100,
-		DivSubsidy:               101,
-		SubsidyReductionInterval: 2048,
+		BaseSubsidy:              6400000000, // 64 VAR per block (same as mainnet)
+		MulSubsidy:               1,          // Numerator for halving (1/2)
+		DivSubsidy:               2,          // Denominator for halving (1/2)
+		SubsidyReductionInterval: 52560,      // ~6 months for testnet (faster than mainnet)
 		WorkRewardProportion:     6,
-		WorkRewardProportionV2:   1,
+		WorkRewardProportionV2:   5,
 		StakeRewardProportion:    3,
-		StakeRewardProportionV2:  8,
-		BlockTaxProportion:       1,
+		StakeRewardProportionV2:  5,
+		BlockTaxProportion:       0,
 
 		// AssumeValid is the hash of a block that has been externally verified
 		// to be valid.  It allows several validation checks to be skipped for
@@ -512,11 +507,10 @@ func TestNet3Params() *Params {
 		StakeMajorityMultiplier: 3,
 		StakeMajorityDivisor:    4,
 
-		// Decred organization related parameters.
-		// Organization address is TcrypGAcGCRVXrES7hWqVZb5oLJKCZEtoL1.
-		OrganizationPkScript:        hexDecode("a914d585cd7426d25b4ea5faf1e6987aacfeda3db94287"),
+		// Monetarium has no treasury (BlockTaxProportion = 0)
+		OrganizationPkScript:        nil,
 		OrganizationPkScriptVersion: 0,
-		BlockOneLedger:              tokenPayouts_TestNet3Params(),
+		BlockOneLedger:              nil, // Monetarium has no premine
 
 		// Sanctioned Politeia keys.
 		PiKeys: [][]byte{
@@ -544,11 +538,65 @@ func TestNet3Params() *Params {
 		TreasuryVoteRequiredMultiplier: 3, // 60% yes votes required
 		TreasuryVoteRequiredDivisor:    5,
 
-		seeders: []string{
-			"testnet-seed-1.decred.org",
-			"testnet-seed-2.decred.org",
-			"testnet-seed.dcrdata.org",
-			"testnet-seed.jholdstock.uk",
+		// HTTP seeders disabled - Monetarium testnet uses manual peer connections
+		seeders: []string{},
+
+		// SKA (Skarb) dual-coin system parameters for testnet
+		// 50 atoms/KB ensures ~10 atoms fee for typical 200-byte tx
+		SKAMinRelayTxFee: 50,
+
+		// SKA coin type configurations (fast testing values)
+		SKACoins: map[cointype.CoinType]*SKACoinConfig{
+			1: {
+				CoinType:       1,
+				Name:           "Skarb-1",
+				Symbol:         "SKA-1",
+				MaxSupply:      10e6 * 1e8, // 10 million SKA-1
+				EmissionHeight: 64,         // Fast emission for testing
+				EmissionWindow: 100,        // 100 block window for testing
+				Active:         true,
+				Description:    "Primary asset-backed SKA coin type for testnet",
+				EmissionAddresses: []string{
+					"TsPlaceholderAddressForTestnetSKA1Emission", // REPLACE with real testnet address
+				},
+				EmissionAmounts: []int64{
+					10e6 * 1e8,
+				},
+				// SECURITY NOTE: This is a placeholder key for development ONLY
+				EmissionKey: mustParseHexPubKeyTestnet("02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"),
+			},
+			2: {
+				CoinType:       2,
+				Name:           "Skarb-2",
+				Symbol:         "SKA-2",
+				MaxSupply:      5e6 * 1e8, // 5 million SKA-2
+				EmissionHeight: 64,        // Fast emission for testing
+				EmissionWindow: 100,       // 100 block window for testing
+				Active:         true,      // Active on testnet for testing
+				Description:    "Secondary SKA coin type for testnet testing",
+				EmissionAddresses: []string{
+					"TsPlaceholderAddressForTestnetSKA2Emission", // REPLACE with real testnet address
+				},
+				EmissionAmounts: []int64{
+					5e6 * 1e8,
+				},
+				// SECURITY NOTE: This is a placeholder key for development ONLY
+				EmissionKey: mustParseHexPubKeyTestnet("0316e57ce5fdb617dc192576d9c860f57e7e7a95592aa32e25941731a2eb2c57d6"),
+			},
 		},
+
+		// Initial SKA types to activate at network genesis
+		InitialSKATypes: []cointype.CoinType{1},
 	}
+}
+
+// mustParseHexPubKeyTestnet parses a hex-encoded public key for testnet.
+// SECURITY WARNING: These are placeholder keys - production must use secure key generation.
+func mustParseHexPubKeyTestnet(hexStr string) *secp256k1.PublicKey {
+	keyBytes := mustParseHex(hexStr)
+	pubKey, err := secp256k1.ParsePubKey(keyBytes)
+	if err != nil {
+		panic("failed to parse public key: " + err.Error())
+	}
+	return pubKey
 }

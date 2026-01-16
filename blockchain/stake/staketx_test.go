@@ -14,6 +14,7 @@ import (
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
@@ -139,22 +140,47 @@ func TestSSTxErrors(t *testing.T) {
 	// ---------------------------------------------------------------------------
 	// Check to make sure the first output is OP_SSTX tagged
 
-	var tx wire.MsgTx
-	testFirstOutTagged := bytes.Replace(bufBytes,
-		[]byte{0x00, 0xe3, 0x23, 0x21, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x1a, 0xba},
-		[]byte{0x00, 0xe3, 0x23, 0x21, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x19},
-		1)
-
-	// Deserialize the manipulated tx
-	rbuf := bytes.NewReader(testFirstOutTagged)
-	err = tx.Deserialize(rbuf)
-	if err != nil {
-		t.Errorf("Deserialize error %v", err)
+	// Create an invalid sstx with first output not properly tagged
+	var sstxUntaggedFirstOut = wire.TxOut{
+		Value:    0x2123e300, // 556000000
+		CoinType: cointype.CoinTypeVAR,
+		Version:  0x0000,
+		PkScript: []byte{
+			0x76, // OP_DUP (missing OP_SSTX)
+			0xa9, // OP_HASH160
+			0x14, // OP_DATA_20
+			0xc3, 0x98, 0xef, 0xa9,
+			0xc3, 0x92, 0xba, 0x60,
+			0x13, 0xc5, 0xe0, 0x4e,
+			0xe7, 0x29, 0x75, 0x5e,
+			0xf7, 0xf5, 0x8b, 0x32,
+			0x88, // OP_EQUALVERIFY
+			0xac, // OP_CHECKSIG
+		},
 	}
 
-	var sstxUntaggedOut = dcrutil.NewTx(&tx)
+	var sstxMsgTxUntagged = &wire.MsgTx{
+		SerType: wire.TxSerializeFull,
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			&sstxTxIn,
+			&sstxTxIn,
+			&sstxTxIn,
+		},
+		TxOut: []*wire.TxOut{
+			&sstxUntaggedFirstOut,
+			&sstxTxOut1,
+			&sstxTxOut2, // emulate change address
+			&sstxTxOut1,
+			&sstxTxOut2, // emulate change address
+			&sstxTxOut3, // P2SH
+			&sstxTxOut4, // P2SH change
+		},
+		LockTime: 0,
+		Expiry:   0,
+	}
+
+	var sstxUntaggedOut = dcrutil.NewTx(sstxMsgTxUntagged)
 	sstxUntaggedOut.SetTree(wire.TxTreeStake)
 	sstxUntaggedOut.SetIndex(0)
 
@@ -166,6 +192,10 @@ func TestSSTxErrors(t *testing.T) {
 	if IsSStx(sstxUntaggedOut.MsgTx()) {
 		t.Errorf("IsSStx claimed an invalid sstx is valid")
 	}
+
+	// For the remaining tests that use byte manipulation, create tx and rbuf variables
+	var tx wire.MsgTx
+	var rbuf *bytes.Reader
 
 	// ---------------------------------------------------------------------------
 	// Test for mismatched number of inputs versus number of outputs
@@ -673,59 +703,63 @@ func TestSSGenErrors(t *testing.T) {
 	// Treasury enabled
 
 	// Verify optional OP_RETURN with no discriminator.
+	// After consolidation requirement, this now fails with missing consolidation error.
 	var ssgenNoDiscriminator = dcrutil.NewTx(ssgenMsgTxNoDiscriminator)
 	ssgenNoDiscriminator.SetVersion(wire.TxVersionTreasury)
 	ssgenNoDiscriminator.SetTree(wire.TxTreeStake)
 	ssgenNoDiscriminator.SetIndex(0)
 
 	err = CheckSSGen(ssgenNoDiscriminator.MsgTx())
-	if !errors.Is(err, ErrSSGenInvalidDiscriminatorLength) {
+	if !errors.Is(err, ErrSSGenMissingConsolidation) {
 		t.Errorf("CheckSSGen should have returned %v but instead returned %v",
-			ErrSSGenInvalidDiscriminatorLength, err)
+			ErrSSGenMissingConsolidation, err)
 	}
 	if IsSSGen(ssgenNoDiscriminator.MsgTx()) {
 		t.Errorf("IsSSGen claimed an invalid ssgen is valid")
 	}
 
 	// Verify optional OP_RETURN with an invalid discriminator length.
+	// After consolidation requirement, this now fails with missing consolidation error.
 	var ssgenInvalidDiscriminator = dcrutil.NewTx(ssgenMsgTxInvalidDiscriminator)
 	ssgenInvalidDiscriminator.SetVersion(wire.TxVersionTreasury)
 	ssgenInvalidDiscriminator.SetTree(wire.TxTreeStake)
 	ssgenInvalidDiscriminator.SetIndex(0)
 
 	err = CheckSSGen(ssgenInvalidDiscriminator.MsgTx())
-	if !errors.Is(err, ErrSSGenInvalidDiscriminatorLength) {
+	if !errors.Is(err, ErrSSGenMissingConsolidation) {
 		t.Errorf("CheckSSGen should have returned %v but instead returned %v",
-			ErrSSGenInvalidDiscriminatorLength, err)
+			ErrSSGenMissingConsolidation, err)
 	}
 	if IsSSGen(ssgenInvalidDiscriminator.MsgTx()) {
 		t.Errorf("IsSSGen claimed an invalid ssgen is valid")
 	}
 
 	// Verify optional OP_RETURN with an unknown discriminator.
+	// After consolidation requirement, this now fails with missing consolidation error.
 	var ssgenInvalidDiscriminator2 = dcrutil.NewTx(ssgenMsgTxUnknownDiscriminator)
 	ssgenInvalidDiscriminator2.SetVersion(wire.TxVersionTreasury)
 	ssgenInvalidDiscriminator2.SetTree(wire.TxTreeStake)
 	ssgenInvalidDiscriminator2.SetIndex(0)
 
 	err = CheckSSGen(ssgenInvalidDiscriminator2.MsgTx())
-	if !errors.Is(err, ErrSSGenUnknownDiscriminator) {
+	if !errors.Is(err, ErrSSGenMissingConsolidation) {
 		t.Errorf("CheckSSGen should have returned %v but instead returned %v",
-			ErrSSGenUnknownDiscriminator, err)
+			ErrSSGenMissingConsolidation, err)
 	}
 	if IsSSGen(ssgenInvalidDiscriminator2.MsgTx()) {
 		t.Errorf("IsSSGen claimed an invalid ssgen is valid")
 	}
 
 	// Verify optional OP_RETURN with an invalid OP_PUSHDATA1.
+	// After consolidation requirement, this now fails with missing consolidation error.
 	var ssgenInvalidDiscriminator3 = dcrutil.NewTx(ssgenMsgTxUnknownDiscriminator2)
 	ssgenInvalidDiscriminator3.SetTree(wire.TxTreeStake)
 	ssgenInvalidDiscriminator3.SetIndex(0)
 
 	err = CheckSSGen(ssgenInvalidDiscriminator3.MsgTx())
-	if !errors.Is(err, ErrSSGenBadGenOuts) {
+	if !errors.Is(err, ErrSSGenMissingConsolidation) {
 		t.Errorf("CheckSSGen should have returned %v but instead returned %v",
-			ErrSSGenBadGenOuts, err)
+			ErrSSGenMissingConsolidation, err)
 	}
 	if IsSSGen(ssgenInvalidDiscriminator3.MsgTx()) {
 		t.Errorf("IsSSGen claimed an invalid ssgen is valid")
@@ -1512,14 +1546,14 @@ func TestCreateRevocationFromTicket(t *testing.T) {
 		ticketOut4,
 		ticketOut5,
 	}
-	revocationHash := mustParseHash("46ae5f78174c6c6e3675d0bbfec27e25c40f3a119e" +
-		"df9183b96261db5cda7a4f")
+	revocationHash := mustParseHash("42d970cf4eaf9c1685dc4f359d9bbd7fa468b06817" +
+		"165087bf926002bf02741a")
 	revocationTxFee := dcrutil.Amount(285000)
 	revocationTxVersion := uint16(1)
 
 	// With auto revocations enabled.
-	autoRevocationsTxHash := mustParseHash("c8999b6e2544f339419cc5416f15e9b942c" +
-		"fd6481246012d2da82f4594310e65")
+	autoRevocationsTxHash := mustParseHash("74950127b7b1027f2da1d94eb746e488b7659a310" +
+		"eddd254a7fccf75681541bf")
 	autoRevocationsTxFee := dcrutil.Amount(0)
 	autoRevocationsTxVersion := TxVersionAutoRevocations
 
@@ -1739,8 +1773,9 @@ var sstxTxIn = wire.TxIn{
 
 // sstxTxOut0 is the first output in the reference valid sstx.
 var sstxTxOut0 = wire.TxOut{
-	Value:   0x2123e300, // 556000000
-	Version: 0x0000,
+	Value:    0x2123e300, // 556000000
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0xba, // OP_SSTX
 		0x76, // OP_DUP
@@ -1758,8 +1793,9 @@ var sstxTxOut0 = wire.TxOut{
 
 // sstxTxOut1 is the second output in the reference valid sstx.
 var sstxTxOut1 = wire.TxOut{
-	Value:   0x00000000, // 0
-	Version: 0x0000,
+	Value:    0x00000000, // 0
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0x6a,                   // OP_RETURN
 		0x1e,                   // 30 bytes to be pushed
@@ -1776,8 +1812,9 @@ var sstxTxOut1 = wire.TxOut{
 
 // sstxTxOut2 is the third output in the reference valid sstx.
 var sstxTxOut2 = wire.TxOut{
-	Value:   0x2223e300,
-	Version: 0x0000,
+	Value:    0x2223e300,
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0xbd, // OP_SSTXCHANGE
 		0x76, // OP_DUP
@@ -1796,8 +1833,9 @@ var sstxTxOut2 = wire.TxOut{
 // sstxTxOut3 is another output in an SStx, this time instruction to pay to
 // a P2SH output.
 var sstxTxOut3 = wire.TxOut{
-	Value:   0x00000000, // 0
-	Version: 0x0000,
+	Value:    0x00000000, // 0
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0x6a,                   // OP_RETURN
 		0x1e,                   // 30 bytes to be pushed
@@ -1815,8 +1853,9 @@ var sstxTxOut3 = wire.TxOut{
 // sstxTxOut4 is the another output in the reference valid sstx, and pays change
 // to a P2SH address.
 var sstxTxOut4 = wire.TxOut{
-	Value:   0x2223e300,
-	Version: 0x0000,
+	Value:    0x2223e300,
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0xbd, // OP_SSTXCHANGE
 		0xa9, // OP_HASH160
@@ -1833,8 +1872,9 @@ var sstxTxOut4 = wire.TxOut{
 // sstxTxOut4VerBad is the third output in the reference valid sstx, with a
 // bad version.
 var sstxTxOut4VerBad = wire.TxOut{
-	Value:   0x2223e300,
-	Version: 0x1234,
+	Value:    0x2223e300,
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x1234,
 	PkScript: []byte{
 		0xbd, // OP_SSTXCHANGE
 		0xa9, // OP_HASH160
@@ -2064,8 +2104,9 @@ var ssgenTxIn1 = wire.TxIn{
 // ssgenTxOut0 is the 0th position output in a valid SSGen tx used to test out
 // the IsSSGen function.
 var ssgenTxOut0 = wire.TxOut{
-	Value:   0x00000000, // 0
-	Version: 0x0000,
+	Value:    0x00000000, // 0
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0x6a,                   // OP_RETURN
 		0x24,                   // 36 bytes to be pushed
@@ -2084,8 +2125,9 @@ var ssgenTxOut0 = wire.TxOut{
 // ssgenTxOut1 is the 1st position output in a valid SSGen tx used to test out
 // the IsSSGen function.
 var ssgenTxOut1 = wire.TxOut{
-	Value:   0x00000000, // 0
-	Version: 0x0000,
+	Value:    0x00000000, // 0
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0x6a,       // OP_RETURN
 		0x02,       // 2 bytes to be pushed
@@ -2096,8 +2138,9 @@ var ssgenTxOut1 = wire.TxOut{
 // ssgenTxOut2 is the 2nd position output in a valid SSGen tx used to test out
 // the IsSSGen function.
 var ssgenTxOut2 = wire.TxOut{
-	Value:   0x2123e300, // 556000000
-	Version: 0x0000,
+	Value:    0x2123e300, // 556000000
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0xbb, // OP_SSGEN
 		0x76, // OP_DUP
@@ -2115,8 +2158,9 @@ var ssgenTxOut2 = wire.TxOut{
 
 // ssgenTxOut3 is a P2SH output.
 var ssgenTxOut3 = wire.TxOut{
-	Value:   0x2123e300, // 556000000
-	Version: 0x0000,
+	Value:    0x2123e300, // 556000000
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0000,
 	PkScript: []byte{
 		0xbb, // OP_SSGEN
 		0xa9, // OP_HASH160
@@ -2132,8 +2176,9 @@ var ssgenTxOut3 = wire.TxOut{
 
 // ssgenTxOut3BadVer is a P2SH output with a bad version.
 var ssgenTxOut3BadVer = wire.TxOut{
-	Value:   0x2123e300, // 556000000
-	Version: 0x0100,
+	Value:    0x2123e300, // 556000000
+	CoinType: cointype.CoinTypeVAR,
+	Version:  0x0100,
 	PkScript: []byte{
 		0xbb, // OP_SSGEN
 		0xa9, // OP_HASH160
@@ -2161,6 +2206,7 @@ var ssgenMsgTx = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 	},
 	LockTime: 0,
 	Expiry:   0,
@@ -2179,6 +2225,7 @@ var ssgenMsgTxExtraInput = &wire.MsgTx{
 		&ssgenTxOut0,
 		&ssgenTxOut1,
 		&ssgenTxOut2,
+		buildConsolidationOutput(),
 	},
 	LockTime: 0,
 	Expiry:   0,
@@ -2211,6 +2258,7 @@ var ssgenMsgTxExtraOutputs = &wire.MsgTx{
 		&ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2,
 		&ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2,
 		&ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2, &ssgenTxOut2,
+		buildConsolidationOutput(),
 	},
 	LockTime: 0,
 	Expiry:   0,
@@ -2229,6 +2277,7 @@ var ssgenMsgTxStakeBaseWrong = &wire.MsgTx{
 		&ssgenTxOut0,
 		&ssgenTxOut1,
 		&ssgenTxOut2,
+		buildConsolidationOutput(),
 	},
 	LockTime: 0,
 	Expiry:   0,
@@ -2248,6 +2297,7 @@ var ssgenMsgTxBadVerOut = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3BadVer,
+		buildConsolidationOutput(),
 	},
 	LockTime: 0,
 	Expiry:   0,
@@ -2266,6 +2316,7 @@ var ssgenMsgTxWrongZeroethOut = &wire.MsgTx{
 		&ssgenTxOut2,
 		&ssgenTxOut1,
 		&ssgenTxOut0,
+		buildConsolidationOutput(),
 	},
 	LockTime: 0,
 	Expiry:   0,
@@ -2284,13 +2335,14 @@ var ssgenMsgTxWrongFirstOut = &wire.MsgTx{
 		&ssgenTxOut0,
 		&ssgenTxOut2,
 		&ssgenTxOut1,
+		buildConsolidationOutput(),
 	},
 	LockTime: 0,
 	Expiry:   0,
 }
 
 // ssgenMsgTxNoDiscriminator is a valid SSGen MsgTx with inputs/outputs and an
-// invalid OP_RETURN that has no discriminator.
+// invalid OP_RETURN that has no discriminator (no consolidation - testing error case).
 var ssgenMsgTxNoDiscriminator = &wire.MsgTx{
 	SerType: wire.TxSerializeFull,
 	Version: 1,
@@ -2310,7 +2362,7 @@ var ssgenMsgTxNoDiscriminator = &wire.MsgTx{
 }
 
 // ssgenMsgTxInvalidDiscriminator is a valid SSGen MsgTx with inputs/outputs
-// and an invalid OP_RETURN that has an invalid discriminator.
+// and an invalid OP_RETURN that has an invalid discriminator (no consolidation - testing error case).
 var ssgenMsgTxInvalidDiscriminator = &wire.MsgTx{
 	SerType: wire.TxSerializeFull,
 	Version: 1,
@@ -2330,7 +2382,7 @@ var ssgenMsgTxInvalidDiscriminator = &wire.MsgTx{
 }
 
 // ssgenMsgTxUnknownDiscriminator is a valid SSGen MsgTx with inputs/outputs
-// and an invalid OP_RETURN that has an unknown discriminator.
+// and an invalid OP_RETURN that has an unknown discriminator (no consolidation - testing error case).
 var ssgenMsgTxUnknownDiscriminator = &wire.MsgTx{
 	SerType: wire.TxSerializeFull,
 	Version: 1,
@@ -2350,7 +2402,7 @@ var ssgenMsgTxUnknownDiscriminator = &wire.MsgTx{
 }
 
 // ssgenMsgTxUnknownDiscriminator2 is a valid SSGen MsgTx with inputs/outputs
-// and an invalid OP_RETURN that is missing a byte at the end.
+// and an invalid OP_RETURN that is missing a byte at the end (no consolidation - testing error case).
 var ssgenMsgTxUnknownDiscriminator2 = &wire.MsgTx{
 	SerType: wire.TxSerializeFull,
 	Version: 1,
@@ -2383,6 +2435,7 @@ var ssgenMsgTxInvalidTV = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTV,
 	},
 	LockTime: 0,
@@ -2403,6 +2456,7 @@ var ssgenMsgTxInvalidTV2 = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTV2,
 	},
 	LockTime: 0,
@@ -2423,6 +2477,7 @@ var ssgenMsgTxInvalidTV3 = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTV3,
 	},
 	LockTime: 0,
@@ -2443,6 +2498,7 @@ var ssgenMsgTxInvalidTV4 = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTV4,
 	},
 	LockTime: 0,
@@ -2463,6 +2519,7 @@ var ssgenMsgTxInvalidTV5 = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTV5,
 	},
 	LockTime: 0,
@@ -2483,6 +2540,7 @@ var ssgenMsgTxInvalidTVote = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTVote,
 	},
 	LockTime: 0,
@@ -2503,6 +2561,7 @@ var ssgenMsgTxInvalidTVote2 = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTVote2,
 	},
 	LockTime: 0,
@@ -2523,6 +2582,7 @@ var ssgenMsgTxInvalidTVote3 = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutInvalidTVote3,
 	},
 	LockTime: 0,
@@ -2543,6 +2603,7 @@ var ssgenMsgTxValid = &wire.MsgTx{
 		&ssgenTxOut1,
 		&ssgenTxOut2,
 		&ssgenTxOut3,
+		buildConsolidationOutput(),
 		&ssgenTxOutValidTV,
 	},
 	LockTime: 0,

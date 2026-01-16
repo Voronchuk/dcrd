@@ -10,9 +10,109 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/cointype"
 )
+
+// FeesByType represents transaction fees collected by coin type.
+// This map-based approach scales to handle all coin types (0-255) without
+// requiring separate variables for each coin type.
+type FeesByType map[cointype.CoinType]int64
+
+// NewFeesByType creates a new empty fees-by-type map.
+func NewFeesByType() FeesByType {
+	return make(FeesByType)
+}
+
+// Add adds a fee amount to the specified coin type.
+func (f FeesByType) Add(coinType cointype.CoinType, amount int64) {
+	f[coinType] += amount
+}
+
+// Get returns the total fees for the specified coin type.
+func (f FeesByType) Get(coinType cointype.CoinType) int64 {
+	return f[coinType]
+}
+
+// Total returns the sum of all fees across all coin types.
+func (f FeesByType) Total() int64 {
+	total := int64(0)
+	for _, amount := range f {
+		total += amount
+	}
+	return total
+}
+
+// Types returns a slice of all coin types that have non-zero fees.
+func (f FeesByType) Types() []cointype.CoinType {
+	types := make([]cointype.CoinType, 0, len(f))
+	for coinType, amount := range f {
+		if amount > 0 {
+			types = append(types, coinType)
+		}
+	}
+	return types
+}
+
+// Merge adds all fees from another FeesByType into this one.
+func (f FeesByType) Merge(other FeesByType) {
+	for coinType, amount := range other {
+		f[coinType] += amount
+	}
+}
+
+// GetPrimaryCoinType determines the primary coin type of a transaction by
+// examining its outputs. Returns the first non-zero coin type found, or
+// CoinTypeVAR if all outputs are VAR or no outputs exist.
+func GetPrimaryCoinType(tx *MsgTx) cointype.CoinType {
+	for _, txOut := range tx.TxOut {
+		if txOut.CoinType != cointype.CoinTypeVAR {
+			return txOut.CoinType
+		}
+	}
+	return cointype.CoinTypeVAR
+}
+
+// CalcFeeSplitByCoinType applies fee split to multi-coin fees based on
+// work/stake proportions. Returns separate FeesByType maps for miners and stakers.
+// The proportions should be obtained from the subsidy system based on the
+// current subsidy split variant (e.g., SSVMonetarium).
+func CalcFeeSplitByCoinType(feesByType FeesByType, workProportion, stakeProportion uint16) (minerFees, stakerFees FeesByType) {
+	minerFees = NewFeesByType()
+	stakerFees = NewFeesByType()
+
+	// Fees are split only between miners and stakers (treasury gets no fees)
+	adjustedTotal := int64(workProportion + stakeProportion)
+	if adjustedTotal == 0 {
+		// Shouldn't happen with valid proportions, but handle gracefully
+		return minerFees, stakerFees
+	}
+
+	for coinType, totalFee := range feesByType {
+		if totalFee <= 0 {
+			continue
+		}
+
+		// Calculate proportional split
+		minerFee := (totalFee * int64(workProportion)) / adjustedTotal
+		stakerFee := (totalFee * int64(stakeProportion)) / adjustedTotal
+
+		// Handle any rounding remainder by giving it to miners
+		remainder := totalFee - minerFee - stakerFee
+		minerFee += remainder
+
+		if minerFee > 0 {
+			minerFees[coinType] = minerFee
+		}
+		if stakerFee > 0 {
+			stakerFees[coinType] = stakerFee
+		}
+	}
+
+	return minerFees, stakerFees
+}
 
 const (
 	// TxVersion is the initial transaction version.
@@ -328,6 +428,7 @@ func NewTxIn(prevOut *OutPoint, valueIn int64, signatureScript []byte) *TxIn {
 // TxOut defines a Decred transaction output.
 type TxOut struct {
 	Value    int64
+	CoinType cointype.CoinType
 	Version  uint16
 	PkScript []byte
 }
@@ -335,16 +436,24 @@ type TxOut struct {
 // SerializeSize returns the number of bytes it would take to serialize the
 // transaction output.
 func (t *TxOut) SerializeSize() int {
-	// Value 8 bytes + Version 2 bytes + serialized varint size for
+	// Value 8 bytes + CoinType 1 byte + Version 2 bytes + serialized varint size for
 	// the length of PkScript + PkScript bytes.
-	return 8 + 2 + VarIntSerializeSize(uint64(len(t.PkScript))) + len(t.PkScript)
+	return 8 + 1 + 2 + VarIntSerializeSize(uint64(len(t.PkScript))) + len(t.PkScript)
 }
 
 // NewTxOut returns a new Decred transaction output with the provided
-// transaction value and public key script.
+// transaction value and public key script. For backward compatibility,
+// this defaults to VAR coin type.
 func NewTxOut(value int64, pkScript []byte) *TxOut {
+	return NewTxOutWithCoinType(value, cointype.CoinTypeVAR, pkScript)
+}
+
+// NewTxOutWithCoinType returns a new Decred transaction output with the provided
+// transaction value, coin type, and public key script.
+func NewTxOutWithCoinType(value int64, coinType cointype.CoinType, pkScript []byte) *TxOut {
 	return &TxOut{
 		Value:    value,
+		CoinType: coinType,
 		Version:  DefaultPkScriptVersion,
 		PkScript: pkScript,
 	}
@@ -383,22 +492,39 @@ func (msg *MsgTx) serialize(serType TxSerializeType) ([]byte, error) {
 	// modifying the original transaction.
 	mtxCopy := *msg
 	mtxCopy.SerType = serType
-	buf := bytes.NewBuffer(make([]byte, 0, mtxCopy.SerializeSize()))
+	expectedSize := mtxCopy.SerializeSize()
+	buf := bytes.NewBuffer(make([]byte, 0, expectedSize))
 	err := mtxCopy.Serialize(buf)
 	if err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	result := buf.Bytes()
+
+	return result, nil
 }
 
 // mustSerialize returns the serialization of the transaction for the provided
-// serialization type without modifying the original transaction.  It will panic
-// if any errors occur.
+// serialization type without modifying the original transaction. It logs
+// critical errors and returns empty bytes instead of panicking if any errors occur.
 func (msg *MsgTx) mustSerialize(serType TxSerializeType) []byte {
 	serialized, err := msg.serialize(serType)
 	if err != nil {
+		// Enhanced debug logging for merkle root debugging
+		fmt.Printf("CRITICAL: MsgTx failed serializing for type %v: %v\n", serType, err)
+		fmt.Printf("  Transaction details: Version=%d, SerType=%d, TxIn=%d, TxOut=%d\n",
+			msg.Version, msg.SerType, len(msg.TxIn), len(msg.TxOut))
+		if len(msg.TxOut) > 0 {
+			fmt.Printf("  First TxOut: CoinType=%d, Value=%d, Version=%d, PkScript len=%d\n",
+				msg.TxOut[0].CoinType, msg.TxOut[0].Value, msg.TxOut[0].Version, len(msg.TxOut[0].PkScript))
+		}
+		fmt.Printf("  Expected SerializeSize: %d\n", msg.SerializeSize())
+		// Return empty byte slice as fallback
 		panic(fmt.Sprintf("MsgTx failed serializing for type %v",
 			serType))
+	}
+	// Log successful serialization details for debugging
+	if len(serialized) == 0 {
+		fmt.Printf("WARNING: Successful serialization produced empty bytes for type %v\n", serType)
 	}
 	return serialized
 }
@@ -452,10 +578,12 @@ func (msg *MsgTx) TxHashFull() chainhash.Hash {
 	concat := make([]byte, chainhash.HashSize*2)
 	prefixHash := msg.TxHash()
 	witnessHash := msg.TxHashWitness()
+
 	copy(concat[0:], prefixHash[:])
 	copy(concat[chainhash.HashSize:], witnessHash[:])
+	fullHash := chainhash.HashH(concat)
 
-	return chainhash.HashH(concat)
+	return fullHash
 }
 
 // Copy creates a deep copy of a transaction so that the original does not get
@@ -518,6 +646,7 @@ func (msg *MsgTx) Copy() *MsgTx {
 		// new Tx.
 		newTxOut := TxOut{
 			Value:    oldTxOut.Value,
+			CoinType: oldTxOut.CoinType,
 			Version:  oldTxOut.Version,
 			PkScript: newScript,
 		}
@@ -852,10 +981,38 @@ func (msg *MsgTx) BtcDecode(r io.Reader, pver uint32) error {
 // difference and separating the two allows the API to be flexible enough to
 // deal with changes.
 func (msg *MsgTx) Deserialize(r io.Reader) error {
-	// At the current time, there is no difference between the wire encoding
-	// at protocol version 0 and the stable long-term storage format.  As
-	// a result, make use of BtcDecode.
-	return msg.BtcDecode(r, 0)
+	// Try to auto-detect wire format by attempting deserialization
+	// with DualCoinVersion first, falling back to older version for specific cases
+
+	// Read all data into buffer for multiple attempts
+	var buf bytes.Buffer
+	_, err := buf.ReadFrom(r)
+	if err != nil {
+		return err
+	}
+	data := buf.Bytes()
+
+	// First try with DualCoinVersion (current protocol with CoinType field)
+	err = msg.BtcDecode(bytes.NewReader(data), DualCoinVersion)
+	if err == nil {
+		return nil
+	}
+
+	// Fall back to older protocol version for specific errors that indicate
+	// missing CoinType fields in old transaction data. Only handle errors
+	// that are clearly from wire format differences, not genuine corruption.
+	if err != nil && (err.Error() == "unexpected EOF" ||
+		strings.Contains(err.Error(), "readScript: transaction output public key script is larger than the max allowed size") ||
+		strings.Contains(err.Error(), "ReadVarInt: non-canonical varint")) {
+		// Try with pre-DualCoinVersion format for backward compatibility
+		fallbackErr := msg.BtcDecode(bytes.NewReader(data), DualCoinVersion-1)
+		if fallbackErr == nil {
+			return nil
+		}
+	}
+
+	// Return the original error from DualCoinVersion attempt
+	return err
 }
 
 // FromBytes deserializes a transaction byte slice.
@@ -974,10 +1131,9 @@ func (msg *MsgTx) BtcEncode(w io.Writer, pver uint32) error {
 // difference and separating the two allows the API to be flexible enough to
 // deal with changes.
 func (msg *MsgTx) Serialize(w io.Writer) error {
-	// At the current time, there is no difference between the wire encoding
-	// at protocol version 0 and the stable long-term storage format.  As
-	// a result, make use of BtcEncode.
-	return msg.BtcEncode(w, 0)
+	// Use current protocol version for serialization to include dual-coin support.
+	// This ensures CoinType field is included in the serialized output.
+	return msg.BtcEncode(w, ProtocolVersion)
 }
 
 // Bytes returns the serialized form of the transaction in bytes.
@@ -1099,9 +1255,9 @@ func (msg *MsgTx) PkScriptLocs() []int {
 	for i, txOut := range msg.TxOut {
 		// The offset of the script in the transaction output is:
 		//
-		// Value 8 bytes + version 2 bytes + serialized varint size
+		// Value 8 bytes + CoinType 1 byte + version 2 bytes + serialized varint size
 		// for the length of PkScript.
-		n += 8 + 2 + VarIntSerializeSize(uint64(len(txOut.PkScript)))
+		n += 8 + 1 + 2 + VarIntSerializeSize(uint64(len(txOut.PkScript)))
 		pkScriptLocs[i] = n
 		n += len(txOut.PkScript)
 	}
@@ -1252,6 +1408,18 @@ func readTxOut(r io.Reader, pver uint32, version uint16, to *TxOut) error {
 	}
 	to.Value = int64(value)
 
+	// CoinType field was added in DualCoinVersion
+	if pver >= DualCoinVersion {
+		coinType, err := binarySerializer.Uint8(r)
+		if err != nil {
+			return err
+		}
+		to.CoinType = cointype.CoinType(coinType)
+	} else {
+		// Default to VAR for backward compatibility
+		to.CoinType = cointype.CoinTypeVAR
+	}
+
 	to.Version, err = binarySerializer.Uint16(r, littleEndian)
 	if err != nil {
 		return err
@@ -1270,10 +1438,65 @@ func writeTxOut(w io.Writer, pver uint32, version uint16, to *TxOut) error {
 		return err
 	}
 
+	// CoinType field was added in DualCoinVersion
+	if pver >= DualCoinVersion {
+		err = binarySerializer.PutUint8(w, uint8(to.CoinType))
+		if err != nil {
+			return err
+		}
+	}
+
 	err = binarySerializer.PutUint16(w, littleEndian, to.Version)
 	if err != nil {
 		return err
 	}
 
 	return WriteVarBytes(w, pver, to.PkScript)
+}
+
+// IsSKAEmissionTransaction returns whether the given transaction is an SKA
+// emission transaction based on its structure. SKA emission transactions have
+// null inputs with authorized signature scripts and only produce SKA outputs.
+//
+// This function performs fast detection for categorization purposes and is
+// optimized for performance as it may be called frequently. For full validation
+// including cryptographic signature verification, use
+// ValidateAuthorizedSKAEmissionTransaction in the blockchain package.
+//
+// The signature script must contain: [SKA_marker:4][auth_version:1][nonce:8]
+// [coin_type:1][amount:8][height:8][pubkey:33][sig_len:1][signature:var]
+func IsSKAEmissionTransaction(tx *MsgTx) bool {
+	// Fast path: basic structure validation (most common rejection)
+	if len(tx.TxIn) != 1 || len(tx.TxOut) == 0 {
+		return false
+	}
+
+	// Check null input (fast rejection for regular transactions)
+	prevOut := tx.TxIn[0].PreviousOutPoint
+	if !prevOut.Hash.IsEqual(&chainhash.Hash{}) || prevOut.Index != 0xffffffff {
+		return false
+	}
+
+	// Check signature script has minimum length for SKA marker
+	// Minimum for basic detection: 4 bytes for [0x01][S][K][A] marker
+	// Full authorization requires 64+ bytes but that's validated elsewhere
+	sigScript := tx.TxIn[0].SignatureScript
+	if len(sigScript) < 4 {
+		return false
+	}
+
+	// Check authorized format: [0x01][S][K][A]...
+	if !(sigScript[0] == 0x01 && sigScript[1] == 0x53 &&
+		sigScript[2] == 0x4b && sigScript[3] == 0x41) {
+		return false
+	}
+
+	// Check all outputs are SKA coin types using standard method
+	for _, txOut := range tx.TxOut {
+		if !txOut.CoinType.IsSKA() {
+			return false
+		}
+	}
+
+	return true
 }

@@ -223,6 +223,30 @@ const (
 	// coinbase input was incorrect.
 	ErrBadCoinbaseAmountIn = ErrorKind("ErrBadCoinbaseAmountIn")
 
+	// ErrBadCoinbaseMultiOutput indicates that the multi-output coinbase
+	// transaction structure is invalid (e.g., wrong fee distribution).
+	ErrBadCoinbaseMultiOutput = ErrorKind("ErrBadCoinbaseMultiOutput")
+
+	// ErrBadCoinbaseFeeDistribution indicates that the coinbase fee
+	// outputs do not match the expected fees by coin type.
+	ErrBadCoinbaseFeeDistribution = ErrorKind("ErrBadCoinbaseFeeDistribution")
+
+	// ErrBadCoinbaseOutputStructure indicates that the coinbase output
+	// structure is malformed (e.g., duplicate coin types, invalid coin types).
+	ErrBadCoinbaseOutputStructure = ErrorKind("ErrBadCoinbaseOutputStructure")
+
+	// ErrBadSKAEmissionOutpoint indicates that the outpoint used by an SKA
+	// emission transaction as input was non-null.
+	ErrBadSKAEmissionOutpoint = ErrorKind("ErrBadSKAEmissionOutpoint")
+
+	// ErrBadSKAEmissionFraudProof indicates that the fraud proof for an SKA
+	// emission transaction input was non-null.
+	ErrBadSKAEmissionFraudProof = ErrorKind("ErrBadSKAEmissionFraudProof")
+
+	// ErrBadSKAEmissionScriptFormat indicates that the signature script for
+	// an SKA emission transaction does not have the required authorized format.
+	ErrBadSKAEmissionScriptFormat = ErrorKind("ErrBadSKAEmissionScriptFormat")
+
 	// ErrBadStakebaseAmountIn indicates that the AmountIn (=subsidy) for a
 	// stakebase input was incorrect.
 	ErrBadStakebaseAmountIn = ErrorKind("ErrBadStakebaseAmountIn")

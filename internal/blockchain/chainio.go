@@ -16,6 +16,7 @@ import (
 	"github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/database/v3"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/gcs/v4"
@@ -528,6 +529,10 @@ type spentTxOut struct {
 	blockIndex    uint32
 	scriptVersion uint16
 
+	// coinType represents the type of coin (VAR or SKA) for this spent output.
+	// This field is essential for dual-coin support during blockchain reorgs.
+	coinType cointype.CoinType
+
 	// packedFlags contains additional info about the output as defined by
 	// txOutFlags.  This approach is used in order to reduce memory usage since
 	// there will be a lot of these in memory.
@@ -567,6 +572,9 @@ func spentTxOutSerializeSize(stxo *spentTxOut) int {
 	size += compressedTxOutSize(uint64(stxo.amount), stxo.scriptVersion,
 		stxo.pkScript, hasAmount)
 
+	// Add 1 byte for coinType (dual-coin support)
+	size += 1
+
 	if stxo.ticketMinOuts != nil {
 		size += len(stxo.ticketMinOuts.data)
 	}
@@ -586,6 +594,10 @@ func putSpentTxOut(target []byte, stxo *spentTxOut) int {
 	const hasAmount = false
 	offset += putCompressedTxOut(target[offset:], 0, stxo.scriptVersion,
 		stxo.pkScript, hasAmount)
+
+	// Serialize coinType (1 byte for dual-coin support)
+	target[offset] = byte(stxo.coinType)
+	offset++
 
 	if stxo.ticketMinOuts != nil {
 		copy(target[offset:], stxo.ticketMinOuts.data)
@@ -619,12 +631,21 @@ func decodeSpentTxOut(serialized []byte, stxo *spentTxOut, amount int64,
 			"txout: %v", err))
 	}
 
+	// Deserialize coinType (1 byte for dual-coin support)
+	// Check if we have enough data for coinType
+	if offset >= len(serialized) {
+		return offset, errDeserialize("unexpected end of data before coinType")
+	}
+	coinType := cointype.CoinType(serialized[offset])
+	offset++
+
 	// Populate the stxo.
 	stxo.amount = amount
 	stxo.pkScript = script
 	stxo.blockHeight = height
 	stxo.blockIndex = index
 	stxo.scriptVersion = scriptVersion
+	stxo.coinType = coinType
 	stxo.packedFlags = txOutFlags(flags)
 
 	// Copy the minimal outputs if this was a ticket submission output.
@@ -659,6 +680,14 @@ func deserializeSpendJournalEntry(serialized []byte, txns []*wire.MsgTx) ([]spen
 			numStxos++
 			continue
 		}
+		// Only skip null-input SSFee (creates new UTXO from scratch).
+		// Augmented SSFee (real input) spends a previous SSFee output.
+		if stake.IsSSFee(tx) {
+			if len(tx.TxIn) > 0 && tx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex {
+				continue // Null-input SSFee - no inputs to count
+			}
+			// Augmented SSFee - fall through to count its input
+		}
 		numStxos += len(tx.TxIn)
 	}
 
@@ -684,6 +713,15 @@ func deserializeSpendJournalEntry(serialized []byte, txns []*wire.MsgTx) ([]spen
 	for txIdx := len(txns) - 1; txIdx > -1; txIdx-- {
 		tx := txns[txIdx]
 		isVote := stake.IsSSGen(tx)
+
+		// Only skip null-input SSFee (creates new UTXO from scratch).
+		// Augmented SSFee (real input) spends a previous SSFee output.
+		if stake.IsSSFee(tx) {
+			if len(tx.TxIn) > 0 && tx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex {
+				continue // Null-input SSFee - no inputs to deserialize
+			}
+			// Augmented SSFee - fall through to deserialize its input
+		}
 
 		// Loop backwards through all of the transaction inputs and read
 		// the associated stxo.
@@ -759,15 +797,31 @@ func dbFetchSpendJournalEntry(dbTx database.Tx, block *dcrutil.Block, isTreasury
 	blockTxns := make([]*wire.MsgTx, 0, len(msgBlock.STransactions)+
 		len(msgBlock.Transactions[1:]))
 	if len(msgBlock.STransactions) > 0 && isTreasuryEnabled {
-		// Skip treasury base and remove tspends.
+		// Skip treasury base and tspends.
+		// Only skip null-input SSFee; augmented SSFee spends real inputs.
 		for _, v := range msgBlock.STransactions[1:] {
 			if stake.IsTSpend(v) {
 				continue
 			}
+			if stake.IsSSFee(v) {
+				if len(v.TxIn) > 0 && v.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex {
+					continue // Null-input SSFee - no inputs
+				}
+				// Augmented SSFee - include it
+			}
 			blockTxns = append(blockTxns, v)
 		}
 	} else {
-		blockTxns = append(blockTxns, msgBlock.STransactions...)
+		// Only skip null-input SSFee; augmented SSFee spends real inputs.
+		for _, v := range msgBlock.STransactions {
+			if stake.IsSSFee(v) {
+				if len(v.TxIn) > 0 && v.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex {
+					continue // Null-input SSFee - no inputs
+				}
+				// Augmented SSFee - include it
+			}
+			blockTxns = append(blockTxns, v)
+		}
 	}
 	blockTxns = append(blockTxns, msgBlock.Transactions[1:]...)
 	if len(blockTxns) > 0 && len(serialized) == 0 {

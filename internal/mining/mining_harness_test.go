@@ -86,13 +86,8 @@ type fakeChain struct {
 // determineSubsidySplitVariant returns the subsidy split variant to use based
 // on the agendas that are active on the fake chain instance.
 func (c *fakeChain) determineSubsidySplitVariant() standalone.SubsidySplitVariant {
-	switch {
-	case c.isSubsidySplitR2AgendaActive:
-		return standalone.SSVDCP0012
-	case c.isSubsidySplitAgendaActive:
-		return standalone.SSVDCP0010
-	}
-	return standalone.SSVOriginal
+	// Always use SSVMonetarium for Monetarium fork
+	return standalone.SSVMonetarium
 }
 
 // AddBlock adds a block that will be available to the BlockByHash function of
@@ -1276,6 +1271,15 @@ func (m *miningHarness) CreateVote(ticket *dcrutil.Tx, mungers ...func(*wire.Msg
 		vote.AddTxOut(wire.NewTxOut(voteRewardValues[i], script))
 	}
 
+	// Add consolidation address output (REQUIRED as of Phase 3)
+	// Use first commitment address hash160 as consolidation address for test consistency
+	consolidationHash160 := ticketHash160s[0]
+	consolidationOut, err := stake.CreateSSFeeConsolidationOutput(consolidationHash160)
+	if err != nil {
+		return nil, err
+	}
+	vote.AddTxOut(consolidationOut)
+
 	// Perform any transaction munging just before signing.
 	for _, f := range mungers {
 		f(vote)
@@ -1489,10 +1493,17 @@ func newMiningHarness(chainParams *chaincfg.Params) (*miningHarness, []spendable
 	// coinbase will mature in the next block.  This ensures the txpool
 	// accepts transactions which spend immature coinbases that will become
 	// mature in the next block.
+	//
+	// Note: Use height 2+ to ensure there's a subsidy (height 0 and 1 have
+	// 0 subsidy since there's no premine in Monetarium).
 	numOutputs := uint32(1)
 	outputs := make([]spendableOutput, 0, numOutputs)
 	curHeight := chain.bestState.Height
-	coinbase, err := harness.CreateCoinbaseTx(curHeight+1, numOutputs)
+	coinbaseHeight := curHeight + 1
+	if coinbaseHeight < 2 {
+		coinbaseHeight = 2
+	}
+	coinbase, err := harness.CreateCoinbaseTx(coinbaseHeight, numOutputs)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
@@ -35,6 +36,7 @@ const (
 	TxTypeTAdd
 	TxTypeTSpend
 	TxTypeTreasuryBase
+	TxTypeSSFee // Stake fee distribution for non-VAR coin types
 )
 
 const (
@@ -77,6 +79,17 @@ const (
 	// are all outputs to the addresses specified in the OP_RETURNs of the
 	// original SStx referenced.
 	MaxOutputsPerSSRtx = MaxInputsPerSStx
+
+	// NumInputsPerSSFee is the exact number of inputs for an SSFee
+	// (stake fee distribution) tx. It has a single input which can be either:
+	// - Null input (like coinbase) - creates new UTXO
+	// - Real UTXO input - augments existing UTXO with fee
+	NumInputsPerSSFee = 1
+
+	// MaxOutputsPerSSFee is the maximum number of outputs in an SSFee tx,
+	// which distributes fees to stakers who voted in the block.
+	// Maximum of 5 votes per block + 1 OP_RETURN marker = 6 outputs max.
+	MaxOutputsPerSSFee = 6
 
 	// SStxPKHMinOutSize is the minimum size of an OP_RETURN commitment output
 	// for an SStx tx.
@@ -1113,35 +1126,79 @@ func CheckSSGenVotes(tx *wire.MsgTx) ([]TreasuryVoteTuple, error) {
 	// discriminator. In the case of 'T','V' the next data push should be N
 	// hashes. If it is we need to decrease the count on OP_SSGEN tests by
 	// one.
+	//
+	// Note: The last output could also be a consolidation address ('S','C'),
+	// which is allowed. We only process treasury votes here.
 	txOutLen := len(tx.TxOut)
 	lastTxOut := tx.TxOut[len(tx.TxOut)-1]
 	var votes []TreasuryVoteTuple
 	if IsNullDataScript(lastTxOut.Version, lastTxOut.PkScript) {
-		txOutLen--
-
-		// We call this function in order to prevent rolling of
-		// additional functions that may not conform 100% to consensus.
-		var err error
-		votes, err = GetSSGenTreasuryVotes(lastTxOut.PkScript)
-		if err != nil {
-			return nil, err
+		// Check if this is a treasury vote (TV) or consolidation address (SC)
+		// Only process if it's a treasury vote
+		//
+		// Determine start of discriminator based on the opcode in [1]
+		start := 2
+		if len(lastTxOut.PkScript) > 1 {
+			switch lastTxOut.PkScript[1] {
+			case 0x4c: // OP_PUSHDATA1: 1-byte length
+				start = 3
+			case 0x4d: // OP_PUSHDATA2: 2-byte length
+				start = 4
+			}
 		}
 
-		// If there are votes the TxVersion must be TxVersionTreasury.
-		// This test is done late in order to allow older versions
-		// SSGen if there are no votes.
-		if !(len(votes) > 0 && tx.Version == wire.TxVersionTreasury) {
-			str := fmt.Sprintf("SSGen invalid tx version %v",
-				tx.Version)
-			return nil, stakeRuleError(ErrSSGenInvalidTxVersion,
-				str)
+		isTreasuryVote := false
+		if len(lastTxOut.PkScript) >= start+2 &&
+			lastTxOut.PkScript[start] == 'T' &&
+			lastTxOut.PkScript[start+1] == 'V' {
+			isTreasuryVote = true
+		}
+
+		if isTreasuryVote {
+			txOutLen--
+
+			// We call this function in order to prevent rolling of
+			// additional functions that may not conform 100% to consensus.
+			var err error
+			votes, err = GetSSGenTreasuryVotes(lastTxOut.PkScript)
+			if err != nil {
+				return nil, err
+			}
+
+			// If there are votes the TxVersion must be TxVersionTreasury.
+			// This test is done late in order to allow older versions
+			// SSGen if there are no votes.
+			if !(len(votes) > 0 && tx.Version == wire.TxVersionTreasury) {
+				str := fmt.Sprintf("SSGen invalid tx version %v",
+					tx.Version)
+				return nil, stakeRuleError(ErrSSGenInvalidTxVersion,
+					str)
+			}
 		}
 	}
 
+	// Ensure that a consolidation address output is present.
+	// This is required for UTXO consolidation of SSFee payments.
+	_, err := ExtractSSFeeConsolidationAddr(tx)
+	if err != nil {
+		str := "SSGen must contain valid consolidation address output"
+		return nil, stakeRuleError(ErrSSGenMissingConsolidation, str)
+	}
+
 	// Ensure that the remaining outputs are OP_SSGEN tagged.
+	// Skip the consolidation address output (OP_RETURN with "SC" marker).
 	for outTxIndex := 2; outTxIndex < txOutLen; outTxIndex++ {
 		scrVersion := tx.TxOut[outTxIndex].Version
 		rawScript := tx.TxOut[outTxIndex].PkScript
+
+		// Skip consolidation address output (OP_RETURN + "SC" + hash160)
+		if len(rawScript) == SSConsolidationOutputSize &&
+			rawScript[0] == 0x6a && // OP_RETURN
+			rawScript[1] == SSConsolidationOpData22 &&
+			rawScript[2] == SSConsolidationMarkerS &&
+			rawScript[3] == SSConsolidationMarkerC {
+			continue
+		}
 
 		// The script should be a OP_SSGEN tagged output.
 		if !IsVoteScript(scrVersion, rawScript) {
@@ -1267,6 +1324,98 @@ func IsSSRtx(tx *wire.MsgTx) bool {
 	return CheckSSRtx(tx) == nil
 }
 
+// CheckSSFee returns an error if a transaction is not a stake fee distribution
+// transaction. These transactions distribute transaction fees to stakers.
+//
+// SSFee transactions are specified as below:
+// Inputs: Single input - either null (creating new UTXO) or real UTXO (augmenting)
+// Outputs: Fee distributions to stakers (max 5, one per voter) or miner
+//
+// The transaction must have:
+// - Not a coinbase or treasurybase transaction
+// - Version >= 3 (same as votes after DCP0001)
+// - Exactly 1 input (null input OR real UTXO input for augmentation)
+// - Between 1 and MaxOutputsPerSSFee outputs
+// - All outputs must have the same coin type (VAR or SKA)
+//
+// SSFee transactions can have two types of inputs:
+// 1. Null input (PreviousOutPoint.Index == MaxPrevOutIndex) - Creates new UTXO
+// 2. Real UTXO input - Augments existing UTXO (adds fee to existing value)
+func CheckSSFee(tx *wire.MsgTx) error {
+	// Check version (must be at least version 3 like modern votes)
+	const minSSFeeVersion = 3
+	if tx.Version < minSSFeeVersion {
+		return fmt.Errorf("SSFee tx version %d less than required %d",
+			tx.Version, minSSFeeVersion)
+	}
+
+	// Check number of inputs (must be exactly 1 input - null or real)
+	if len(tx.TxIn) != NumInputsPerSSFee {
+		return fmt.Errorf("SSFee tx has %d inputs, expected %d",
+			len(tx.TxIn), NumInputsPerSSFee)
+	}
+
+	// Input can be either null (creating new UTXO) or real (augmenting existing)
+	// Both are valid for SSFee transactions.
+	// Note: Real input validation (UTXO existence, coin type match) happens
+	// in validateSSFeeTxns() where the UTXO viewpoint is available.
+
+	// Check number of outputs
+	if len(tx.TxOut) < 1 || len(tx.TxOut) > MaxOutputsPerSSFee {
+		return fmt.Errorf("SSFee tx has %d outputs, expected 1-%d",
+			len(tx.TxOut), MaxOutputsPerSSFee)
+	}
+
+	// SSFee transactions must have an OP_RETURN output with "SF" or "MF" marker
+	// to distinguish them from coinbase/treasurybase.
+	hasMarker := false
+	for _, out := range tx.TxOut {
+		if IsSSFeeMarkerScript(out.PkScript) {
+			hasMarker = true
+			break
+		}
+	}
+	if !hasMarker {
+		return fmt.Errorf("SSFee tx missing required SF or MF marker in OP_RETURN output")
+	}
+
+	// All outputs must have the same coin type
+	if len(tx.TxOut) > 0 {
+		firstCoinType := tx.TxOut[0].CoinType
+
+		// Determine if this is a miner SSFee (MF) or staker SSFee (SF)
+		// by checking the marker in the OP_RETURN output
+		isMinerFee := false
+		for _, out := range tx.TxOut {
+			if HasSSFeeMarker(out.PkScript) == SSFeeMarkerMiner {
+				isMinerFee = true
+				break
+			}
+		}
+
+		// Miner SSFee (MF) cannot distribute VAR (VAR miner fees go to coinbase)
+		// Staker SSFee (SF) CAN distribute VAR (VAR staker fees use SSFee)
+		if isMinerFee && firstCoinType == cointype.CoinTypeVAR {
+			return fmt.Errorf("miner SSFee tx cannot use VAR coin type")
+		}
+
+		for i, out := range tx.TxOut {
+			if out.CoinType != firstCoinType {
+				return fmt.Errorf("SSFee tx output %d has coin type %d, expected %d",
+					i, out.CoinType, firstCoinType)
+			}
+		}
+	}
+
+	return nil
+}
+
+// IsSSFee returns whether or not a transaction is a stake fee distribution
+// transaction.
+func IsSSFee(tx *wire.MsgTx) bool {
+	return CheckSSFee(tx) == nil
+}
+
 // DetermineTxType determines the type of stake transaction a transaction is; if
 // none, it returns that it is an assumed regular tx.
 func DetermineTxType(tx *wire.MsgTx) TxType {
@@ -1278,6 +1427,11 @@ func DetermineTxType(tx *wire.MsgTx) TxType {
 	}
 	if IsSSRtx(tx) {
 		return TxTypeSSRtx
+	}
+	// Check for SSFee before treasury transactions
+	// SSFee uses version 3+ but doesn't require treasury version
+	if IsSSFee(tx) {
+		return TxTypeSSFee
 	}
 	if tx.Version >= wire.TxVersionTreasury {
 		if IsTAdd(tx) {
@@ -1407,9 +1561,9 @@ func CreateRevocationFromTicket(ticketHash *chainhash.Hash,
 	feeApplied := false
 	for i, payToHash := range payToHashes {
 		// Ensure amount is in the valid range for monetary amounts.
-		if amounts[i] <= 0 || amounts[i] > dcrutil.MaxAmount {
+		if amounts[i] <= 0 || amounts[i] > int64(cointype.MaxVARAmount) {
 			str := fmt.Sprintf("invalid output amount: %v (min: 0, max: %v)",
-				amounts[i], dcrutil.MaxAmount)
+				amounts[i], cointype.MaxVARAmount)
 			return nil, stakeRuleError(ErrSStxBadCommitAmount, str)
 		}
 

@@ -9,6 +9,7 @@ import (
 	"container/heap"
 
 	"github.com/decred/dcrd/blockchain/stake/v5"
+	"github.com/decred/dcrd/cointype"
 )
 
 // txPrioItem houses a transaction along with extra information that allows the
@@ -18,9 +19,11 @@ type txPrioItem struct {
 	txDesc         *TxDesc
 	txType         stake.TxType
 	autoRevocation bool
+	isSKAEmission  bool // True if this is an SKA emission transaction
 	fee            int64
 	priority       float64
 	feePerKB       float64
+	coinType       cointype.CoinType // Primary coin type for this transaction
 }
 
 // txPriorityQueueLessFunc describes a function that can be used as a compare
@@ -80,7 +83,8 @@ func (pq *txPriorityQueue) SetLessFunc(lessFunc txPriorityQueueLessFunc) {
 // stakePriority is an integer that is used to sort stake transactions
 // by importance when they enter the min heap for block construction.  The
 // priority is:
-//   - 3 is for votes (highest)
+//   - 4 is for SKA emissions (highest - must be included at emission height)
+//   - 3 is for votes
 //   - 2 for automatic revocations
 //   - 1 for tickets
 //   - 0 for regular transactions and revocations (lowest)
@@ -91,12 +95,15 @@ const (
 	ticketPriority
 	autoRevocPriority
 	votePriority
+	skaEmissionPriority
 )
 
-// stakePriority assigns a stake priority based on a transaction type.
-func txStakePriority(txType stake.TxType, autoRevocation bool) stakePriority {
+// stakePriority assigns a stake priority based on a transaction type and flags.
+func txStakePriority(txType stake.TxType, autoRevocation bool, isSKAEmission bool) stakePriority {
 	prio := regOrRevocPriority
 	switch {
+	case isSKAEmission:
+		prio = skaEmissionPriority
 	case txType == stake.TxTypeSSGen:
 		prio = votePriority
 	case txType == stake.TxTypeSSRtx && autoRevocation:
@@ -109,12 +116,12 @@ func txStakePriority(txType stake.TxType, autoRevocation bool) stakePriority {
 }
 
 // compareStakePriority compares the stake priority of two transactions.
-// It uses votes > tickets > regular transactions or revocations. It
+// It uses SKA emissions > votes > tickets > regular transactions or revocations. It
 // returns 1 if i > j, 0 if i == j, and -1 if i < j in terms of stake
 // priority.
 func compareStakePriority(i, j *txPrioItem) int {
-	iStakePriority := txStakePriority(i.txType, i.autoRevocation)
-	jStakePriority := txStakePriority(j.txType, j.autoRevocation)
+	iStakePriority := txStakePriority(i.txType, i.autoRevocation, i.isSKAEmission)
+	jStakePriority := txStakePriority(j.txType, j.autoRevocation, j.isSKAEmission)
 
 	if iStakePriority > jStakePriority {
 		return 1
@@ -145,6 +152,30 @@ func txPQByStakeAndFee(pq *txPriorityQueue, i, j int) bool {
 
 	// The stake priorities are equal, so return based on fees
 	// per KB.
+	return pq.items[i].feePerKB > pq.items[j].feePerKB
+}
+
+// txPQByCoinTypeAndFee sorts a txPriorityQueue by stake priority, then by
+// coin-type-aware fee rates, and finally by transaction priority.
+// This provides intelligent economic prioritization per coin type.
+func txPQByCoinTypeAndFee(pq *txPriorityQueue, i, j int) bool {
+	// Sort by stake priority first, continue if they're the same stake priority.
+	cmp := compareStakePriority(pq.items[i], pq.items[j])
+	if cmp == 1 {
+		return true
+	}
+	if cmp == -1 {
+		return false
+	}
+
+	// For equal stake priorities, use coin-type-adjusted fee rates
+	// This allows each coin type to have its own fee market dynamics
+	// while maintaining overall transaction ordering fairness
+	if pq.items[i].feePerKB == pq.items[j].feePerKB {
+		return pq.items[i].priority > pq.items[j].priority
+	}
+
+	// Return based on coin-type-adjusted fees per KB
 	return pq.items[i].feePerKB > pq.items[j].feePerKB
 }
 

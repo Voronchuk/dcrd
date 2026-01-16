@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/decred/dcrd/blockchain/stake/v5"
+	"github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/internal/blockchain"
 	"github.com/decred/dcrd/txscript/v4"
@@ -87,11 +89,41 @@ func calcMinRequiredTxRelayFee(serializedSize int64, minRelayTxFee dcrutil.Amoun
 
 	// Set the minimum fee to the maximum possible value if the calculated
 	// fee is not in the valid range for monetary amounts.
-	if minFee < 0 || minFee > dcrutil.MaxAmount {
-		minFee = dcrutil.MaxAmount
+	if minFee < 0 || minFee > int64(cointype.MaxVARAmount) {
+		minFee = int64(cointype.MaxVARAmount)
 	}
 
 	return minFee
+}
+
+// calcMinRequiredSKATxRelayFee returns the minimum SKA transaction fee required for a
+// transaction with the passed serialized size to be accepted into the memory
+// pool and relayed. SKA transactions may have different fee requirements.
+func calcMinRequiredSKATxRelayFee(serializedSize int64, minRelayTxFee dcrutil.Amount) int64 {
+	// For now, SKA transactions use the same fee calculation as VAR transactions.
+	// This could be modified in the future to have different fee structures.
+	return calcMinRequiredTxRelayFee(serializedSize, minRelayTxFee)
+}
+
+// calcMinRequiredTxRelayFeeForCoinType returns the minimum transaction fee for the
+// specified coin type.
+func calcMinRequiredTxRelayFeeForCoinType(serializedSize int64, coinType cointype.CoinType,
+	minRelayTxFee dcrutil.Amount, chainParams *chaincfg.Params) int64 {
+	switch coinType {
+	case cointype.CoinTypeVAR:
+		return calcMinRequiredTxRelayFee(serializedSize, minRelayTxFee)
+	default:
+		// Handle all SKA coin types (1-255)
+		if coinType.IsSKA() {
+			// Use SKA-specific minimum relay fee if available, otherwise use VAR fee
+			if chainParams.SKAMinRelayTxFee > 0 {
+				return calcMinRequiredSKATxRelayFee(serializedSize, dcrutil.Amount(chainParams.SKAMinRelayTxFee))
+			}
+			return calcMinRequiredSKATxRelayFee(serializedSize, minRelayTxFee)
+		}
+		// Default to VAR fee calculation for unknown coin types
+		return calcMinRequiredTxRelayFee(serializedSize, minRelayTxFee)
+	}
 }
 
 // checkInputsStandard performs a series of checks on a transaction's inputs
@@ -111,6 +143,12 @@ func checkInputsStandard(tx *dcrutil.Tx, txType stake.TxType, utxoView *blockcha
 	// NOTE: The reference implementation also does a coinbase check here,
 	// but coinbases have already been rejected prior to calling this
 	// function so no need to recheck.
+
+	// SKA emission transactions have null inputs that are not standard by definition.
+	// Skip standard input validation for SKA emission transactions.
+	if wire.IsSKAEmissionTransaction(tx.MsgTx()) {
+		return nil
+	}
 
 	// Ignore the first input if this is a SSGen (vote) or tspend since
 	// those inputs are not standard by definition.
@@ -218,6 +256,12 @@ func checkPkScriptStandard(version uint16, pkScript []byte,
 // particular, if the cost to the network to spend coins is more than 1/3 of the
 // minimum transaction relay fee, it is considered dust.
 func isDust(txOut *wire.TxOut, minRelayTxFee dcrutil.Amount) bool {
+	// SKA burn scripts are intentionally unspendable but should not be
+	// considered dust - they are valid burn transactions.
+	if stdscript.IsSKABurnScriptV0(txOut.PkScript) {
+		return false
+	}
+
 	// Unspendable outputs are considered dust.
 	if txscript.IsUnspendable(txOut.Value, txOut.PkScript) {
 		return true
@@ -323,11 +367,22 @@ func checkTransactionStandard(tx *dcrutil.Tx, txType stake.TxType, height int64,
 		return txRuleError(ErrNonStandard, str)
 	}
 
+	// SKA emission transactions have special authorization scripts with the
+	// SKA marker that are not push-only by definition. Skip signature script
+	// push-only validation for SKA emission transactions.
+	isSKAEmission := wire.IsSKAEmissionTransaction(msgTx)
+
 	for i, txIn := range msgTx.TxIn {
 		// TSpends should only have one input and that input has a
 		// specific format which is checked by IsTSpend, so if this tx
 		// is a tspend, skip it.
 		if txType == stake.TxTypeTSpend {
+			continue
+		}
+
+		// Votes have a stakebase input (input 0) with a special signature
+		// script defined in chain params. Skip standardness checks for it.
+		if txType == stake.TxTypeSSGen && i == 0 {
 			continue
 		}
 
@@ -345,7 +400,9 @@ func checkTransactionStandard(tx *dcrutil.Tx, txType stake.TxType, height int64,
 
 		// Each transaction input signature script must only contain
 		// opcodes which push data onto the stack.
-		if !txscript.IsPushOnlyScript(txIn.SignatureScript) {
+		// Skip this check for SKA emission transactions since their
+		// authorization scripts contain the SKA marker and raw data.
+		if !isSKAEmission && !txscript.IsPushOnlyScript(txIn.SignatureScript) {
 			str := fmt.Sprintf("transaction input %d: signature "+
 				"script is not push only", i)
 			return txRuleError(ErrNonStandard, str)

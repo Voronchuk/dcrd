@@ -152,10 +152,9 @@ func (msg *MsgBlock) BtcDecode(r io.Reader, pver uint32) error {
 // in both instances, but there is a distinct difference and separating the two
 // allows the API to be flexible enough to deal with changes.
 func (msg *MsgBlock) Deserialize(r io.Reader) error {
-	// At the current time, there is no difference between the wire encoding
-	// at protocol version 0 and the stable long-term storage format.  As
-	// a result, make use of BtcDecode.
-	return msg.BtcDecode(r, 0)
+	// Use current protocol version for deserialization to include dual-coin support.
+	// This ensures CoinType field is read from the serialized input.
+	return msg.BtcDecode(r, ProtocolVersion)
 }
 
 // FromBytes deserializes a transaction byte slice.
@@ -172,15 +171,14 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, []TxLoc, error)
 	const op = "MsgBlock.DeserializeTxLoc"
 	fullLen := r.Len()
 
-	// At the current time, there is no difference between the wire encoding
-	// at protocol version 0 and the stable long-term storage format.  As
-	// a result, make use of existing wire protocol functions.
-	err := readBlockHeader(r, 0, &msg.Header)
+	// Use current protocol version to properly handle dual-coin features.
+	// This ensures compatibility with blocks serialized using current protocol.
+	err := readBlockHeader(r, ProtocolVersion, &msg.Header)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	txCount, err := ReadVarInt(r, 0)
+	txCount, err := ReadVarInt(r, ProtocolVersion)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -204,7 +202,7 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, []TxLoc, error)
 	for i := uint64(0); i < txCount; i++ {
 		txLocs[i].TxStart = fullLen - r.Len()
 		var tx MsgTx
-		err := tx.Deserialize(r)
+		err := tx.BtcDecode(r, ProtocolVersion)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -212,7 +210,7 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, []TxLoc, error)
 		txLocs[i].TxLen = (fullLen - r.Len()) - txLocs[i].TxStart
 	}
 
-	stakeTxCount, err := ReadVarInt(r, 0)
+	stakeTxCount, err := ReadVarInt(r, ProtocolVersion)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -236,7 +234,7 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, []TxLoc, error)
 	for i := uint64(0); i < stakeTxCount; i++ {
 		sTxLocs[i].TxStart = fullLen - r.Len()
 		var tx MsgTx
-		err := tx.Deserialize(r)
+		err := tx.BtcDecode(r, ProtocolVersion)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -294,10 +292,9 @@ func (msg *MsgBlock) BtcEncode(w io.Writer, pver uint32) error {
 // instances, but there is a distinct difference and separating the two allows
 // the API to be flexible enough to deal with changes.
 func (msg *MsgBlock) Serialize(w io.Writer) error {
-	// At the current time, there is no difference between the wire encoding
-	// at protocol version 0 and the stable long-term storage format.  As
-	// a result, make use of BtcEncode.
-	return msg.BtcEncode(w, 0)
+	// Use current protocol version for serialization to include dual-coin support.
+	// This ensures CoinType field is included in the serialized output.
+	return msg.BtcEncode(w, ProtocolVersion)
 }
 
 // Bytes returns the serialized form of the block in bytes.

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"math"
 	"strconv"
+
+	"github.com/decred/dcrd/cointype"
 )
 
 // AmountUnit describes a method of converting an Amount to something
@@ -30,23 +32,23 @@ const (
 
 // String returns the unit as a string.  For recognized units, the SI
 // prefix is used, or "Atom" for the base unit.  For all unrecognized
-// units, "1eN DCR" is returned, where N is the AmountUnit.
+// units, "1eN VAR" is returned, where N is the AmountUnit.
 func (u AmountUnit) String() string {
 	switch u {
 	case AmountMegaCoin:
-		return "MDCR"
+		return "MVAR"
 	case AmountKiloCoin:
-		return "kDCR"
+		return "kVAR"
 	case AmountCoin:
-		return "DCR"
+		return "VAR"
 	case AmountMilliCoin:
-		return "mDCR"
+		return "mVAR"
 	case AmountMicroCoin:
-		return "μDCR"
+		return "μVAR"
 	case AmountAtom:
 		return "Atom"
 	default:
-		return "1e" + strconv.FormatInt(int64(u), 10) + " DCR"
+		return "1e" + strconv.FormatInt(int64(u), 10) + " VAR"
 	}
 }
 
@@ -70,10 +72,17 @@ func round(f float64) Amount {
 // but does not check that the amount is within the total amount of coins
 // producible as f may not refer to an amount at a single moment in time.
 //
-// NewAmount is for specifically for converting DCR to Atoms (atomic units).
+// NewAmount is for specifically for converting VAR to Atoms (atomic units).
 // For creating a new Amount with an int64 value which denotes a quantity of
 // Atoms, do a simple type conversion from type int64 to Amount.
 func NewAmount(f float64) (Amount, error) {
+	return NewAmountForCoinType(f, cointype.CoinTypeVAR)
+}
+
+// NewAmountForCoinType creates an Amount from a floating point value for
+// a specific coin type. This function handles the conversion from coins
+// to atoms for both VAR and SKA.
+func NewAmountForCoinType(f float64, coinType cointype.CoinType) (Amount, error) {
 	// The amount is only considered invalid if it cannot be represented
 	// as an integer type.  This may happen if f is NaN or +-Infinity.
 	switch {
@@ -85,7 +94,12 @@ func NewAmount(f float64) (Amount, error) {
 		return 0, errors.New("invalid coin amount")
 	}
 
-	return round(f * AtomsPerCoin), nil
+	if !coinType.IsValid() {
+		return 0, cointype.ErrInvalidCoinType
+	}
+
+	atomsPerCoin := coinType.AtomsPerCoin()
+	return round(f * float64(atomsPerCoin)), nil
 }
 
 // ToUnit converts a monetary amount counted in coin base units to a
@@ -95,8 +109,27 @@ func (a Amount) ToUnit(u AmountUnit) float64 {
 }
 
 // ToCoin is the equivalent of calling ToUnit with AmountCoin.
+// This method assumes VAR for backward compatibility.
 func (a Amount) ToCoin() float64 {
 	return a.ToUnit(AmountCoin)
+}
+
+// ToVAR converts the amount to VAR coins as a floating point value.
+func (a Amount) ToVAR() float64 {
+	return float64(a) / cointype.AtomsPerVAR
+}
+
+// ToSKA converts the amount to SKA coins as a floating point value.
+func (a Amount) ToSKA() float64 {
+	return float64(a) / cointype.AtomsPerSKA
+}
+
+// ToCoinType converts the amount to coins for the specified coin type.
+func (a Amount) ToCoinType(coinType cointype.CoinType) float64 {
+	if !coinType.IsValid() {
+		return 0
+	}
+	return float64(a) / float64(coinType.AtomsPerCoin())
 }
 
 // Format formats a monetary amount counted in coin base units as a
@@ -109,8 +142,28 @@ func (a Amount) Format(u AmountUnit) string {
 }
 
 // String is the equivalent of calling Format with AmountCoin.
+// This method assumes VAR for backward compatibility.
 func (a Amount) String() string {
 	return a.Format(AmountCoin)
+}
+
+// StringForCoinType formats the amount as a string for the specified coin type.
+func (a Amount) StringForCoinType(coinType cointype.CoinType) string {
+	if !coinType.IsValid() {
+		return "0 Unknown"
+	}
+	value := a.ToCoinType(coinType)
+	return strconv.FormatFloat(value, 'f', 8, 64) + " " + coinType.String()
+}
+
+// StringVAR formats the amount as a VAR string.
+func (a Amount) StringVAR() string {
+	return a.StringForCoinType(cointype.CoinTypeVAR)
+}
+
+// StringSKA formats the amount as a SKA string.
+func (a Amount) StringSKA() string {
+	return a.StringForCoinType(cointype.CoinType(1))
 }
 
 // MulF64 multiplies an Amount by a floating point value.  While this is not

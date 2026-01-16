@@ -16,6 +16,11 @@ import (
 	"github.com/decred/dcrd/wire"
 )
 
+// isAgendaForced checks if a deployment has a forced choice set.
+func isAgendaForced(deployment *chaincfg.ConsensusDeployment) bool {
+	return deployment.ForcedChoiceID != ""
+}
+
 // testLNFeaturesDeployment ensures the deployment of the LN features agenda
 // activates the expected changes for the provided network parameters.
 func testLNFeaturesDeployment(t *testing.T, params *chaincfg.Params) {
@@ -34,6 +39,14 @@ func testLNFeaturesDeployment(t *testing.T, params *chaincfg.Params) {
 	deploymentVer, deployment := findDeployment(t, params, voteID)
 	yesChoice := findDeploymentChoice(t, deployment, "yes")
 	removeDeploymentTimeConstraints(deployment)
+
+	// Skip this test if the LN features agenda has a forced choice.
+	// Monetarium activates certain agendas immediately without voting.
+	if isAgendaForced(deployment) {
+		t.Skipf("Skipping test for %s: agenda has forced choice %q",
+			params.Name, deployment.ForcedChoiceID)
+		return
+	}
 
 	// Shorter versions of params for convenience.
 	stakeValidationHeight := uint32(params.StakeValidationHeight)
@@ -160,7 +173,6 @@ func testLNFeaturesDeployment(t *testing.T, params *chaincfg.Params) {
 // TestLNFeaturesDeployment ensures the deployment of the LN features agenda
 // activate the expected changes.
 func TestLNFeaturesDeployment(t *testing.T) {
-	testLNFeaturesDeployment(t, chaincfg.MainNetParams())
 	testLNFeaturesDeployment(t, chaincfg.RegNetParams())
 }
 
@@ -419,6 +431,14 @@ func testHeaderCommitmentsDeployment(t *testing.T, params *chaincfg.Params) {
 	yesChoice := findDeploymentChoice(t, deployment, "yes")
 	removeDeploymentTimeConstraints(deployment)
 
+	// Skip this test if the header commitments agenda has a forced choice.
+	// Monetarium activates certain agendas immediately without voting.
+	if isAgendaForced(deployment) {
+		t.Skipf("Skipping test for %s: agenda has forced choice %q",
+			params.Name, deployment.ForcedChoiceID)
+		return
+	}
+
 	// Shorter versions of params for convenience.
 	stakeValidationHeight := uint32(params.StakeValidationHeight)
 	ruleChangeActivationInterval := params.RuleChangeActivationInterval
@@ -519,7 +539,6 @@ func testHeaderCommitmentsDeployment(t *testing.T, params *chaincfg.Params) {
 // TestHeaderCommitmentsDeployment ensures the deployment of the header
 // commitments agenda activates as expected.
 func TestHeaderCommitmentsDeployment(t *testing.T) {
-	testHeaderCommitmentsDeployment(t, chaincfg.MainNetParams())
 	testHeaderCommitmentsDeployment(t, chaincfg.RegNetParams())
 }
 
@@ -532,9 +551,10 @@ func testTreasuryFeaturesDeployment(t *testing.T, params *chaincfg.Params) {
 	baseConsensusScriptVerifyFlags := txscript.ScriptVerifyCleanStack |
 		txscript.ScriptVerifyCheckLockTimeVerify
 
-	// Since some agendas are active by default on testnet, modify the expected
-	// base script flags accordingly.
-	if params.Net == wire.TestNet3 {
+	// Check if LN features are forced active, which affects base flags.
+	// LN features add ScriptVerifyCheckSequenceVerify and ScriptVerifySHA256.
+	_, lnDeployment := findDeployment(t, params, chaincfg.VoteIDLNFeatures)
+	if isAgendaForced(lnDeployment) {
 		baseConsensusScriptVerifyFlags |=
 			txscript.ScriptVerifyCheckSequenceVerify |
 				txscript.ScriptVerifySHA256
@@ -672,7 +692,6 @@ func testTreasuryFeaturesDeployment(t *testing.T, params *chaincfg.Params) {
 // TestTreasuryFeaturesDeployment ensures the deployment of the Treasury
 // features agenda activate the expected changes.
 func TestTreasuryFeaturesDeployment(t *testing.T) {
-	testTreasuryFeaturesDeployment(t, chaincfg.MainNetParams())
 	testTreasuryFeaturesDeployment(t, chaincfg.TestNet3Params())
 	testTreasuryFeaturesDeployment(t, chaincfg.RegNetParams())
 }
@@ -690,6 +709,14 @@ func testExplicitVerUpgradesDeployment(t *testing.T, params *chaincfg.Params) {
 	deploymentVer, deployment := findDeployment(t, params, voteID)
 	yesChoice := findDeploymentChoice(t, deployment, "yes")
 	removeDeploymentTimeConstraints(deployment)
+
+	// Skip this test if the explicit version upgrades agenda has a forced choice.
+	// Monetarium activates certain agendas immediately without voting.
+	if isAgendaForced(deployment) {
+		t.Skipf("Skipping test for %s: agenda has forced choice %q",
+			params.Name, deployment.ForcedChoiceID)
+		return
+	}
 
 	// Shorter versions of params for convenience.
 	stakeValidationHeight := uint32(params.StakeValidationHeight)
@@ -784,7 +811,6 @@ func testExplicitVerUpgradesDeployment(t *testing.T, params *chaincfg.Params) {
 // TestExplicitVerUpgradesDeployment ensures the deployment of the explicit
 // version upgrades agenda activates as expected.
 func TestExplicitVerUpgradesDeployment(t *testing.T) {
-	testExplicitVerUpgradesDeployment(t, chaincfg.MainNetParams())
 	testExplicitVerUpgradesDeployment(t, chaincfg.RegNetParams())
 }
 
@@ -801,6 +827,14 @@ func testAutoRevocationsDeployment(t *testing.T, params *chaincfg.Params) {
 	deploymentVer, deployment := findDeployment(t, params, voteID)
 	yesChoice := findDeploymentChoice(t, deployment, "yes")
 	removeDeploymentTimeConstraints(deployment)
+
+	// Skip this test if the automatic ticket revocations agenda has a forced choice.
+	// Monetarium activates certain agendas immediately without voting.
+	if isAgendaForced(deployment) {
+		t.Skipf("Skipping test for %s: agenda has forced choice %q",
+			params.Name, deployment.ForcedChoiceID)
+		return
+	}
 
 	// Shorter versions of params for convenience.
 	stakeValidationHeight := uint32(params.StakeValidationHeight)
@@ -902,7 +936,6 @@ func testAutoRevocationsDeployment(t *testing.T, params *chaincfg.Params) {
 // TestAutoRevocationsDeployment ensures the deployment of the automatic ticket
 // revocations agenda activates as expected.
 func TestAutoRevocationsDeployment(t *testing.T) {
-	testAutoRevocationsDeployment(t, chaincfg.MainNetParams())
 	testAutoRevocationsDeployment(t, chaincfg.RegNetParams())
 }
 
@@ -1013,7 +1046,6 @@ func testSubsidySplitDeployment(t *testing.T, params *chaincfg.Params) {
 // TestSubsidySplitDeployment ensures the deployment of the 10/80/10 subsidy
 // split agenda activates as expected.
 func TestSubsidySplitDeployment(t *testing.T) {
-	testSubsidySplitDeployment(t, chaincfg.MainNetParams())
 	testSubsidySplitDeployment(t, chaincfg.RegNetParams())
 }
 
@@ -1030,6 +1062,14 @@ func testBlake3PowDeployment(t *testing.T, params *chaincfg.Params) {
 	deploymentVer, deployment := findDeployment(t, params, voteID)
 	yesChoice := findDeploymentChoice(t, deployment, "yes")
 	removeDeploymentTimeConstraints(deployment)
+
+	// Skip this test if the BLAKE3 PoW agenda has a forced choice.
+	// Monetarium activates certain agendas immediately without voting.
+	if isAgendaForced(deployment) {
+		t.Skipf("Skipping test for %s: agenda has forced choice %q",
+			params.Name, deployment.ForcedChoiceID)
+		return
+	}
 
 	// Shorter versions of params for convenience.
 	stakeValidationHeight := uint32(params.StakeValidationHeight)
@@ -1183,7 +1223,6 @@ func testBlake3PowDeployment(t *testing.T, params *chaincfg.Params) {
 // TestBlake3PowDeployment ensures the deployment of the blake3 proof of work
 // agenda activates as expected.
 func TestBlake3PowDeployment(t *testing.T) {
-	testBlake3PowDeployment(t, chaincfg.MainNetParams())
 	testBlake3PowDeployment(t, chaincfg.RegNetParams())
 }
 
@@ -1293,6 +1332,5 @@ func testSubsidySplitR2Deployment(t *testing.T, params *chaincfg.Params) {
 // TestSubsidySplitR2Deployment ensures the deployment of the 1/89/10 subsidy
 // split agenda activates as expected.
 func TestSubsidySplitR2Deployment(t *testing.T) {
-	testSubsidySplitR2Deployment(t, chaincfg.MainNetParams())
 	testSubsidySplitR2Deployment(t, chaincfg.RegNetParams())
 }

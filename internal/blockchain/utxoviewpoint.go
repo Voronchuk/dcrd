@@ -12,6 +12,7 @@ import (
 	"github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/database/v3"
 	"github.com/decred/dcrd/dcrutil/v4"
 	"github.com/decred/dcrd/txscript/v4"
@@ -85,6 +86,7 @@ func (view *UtxoViewpoint) addTxOut(outpoint wire.OutPoint, txOut *wire.TxOut,
 	entry.blockHeight = uint32(blockHeight)
 	entry.blockIndex = blockIndex
 	entry.scriptVersion = txOut.Version
+	entry.coinType = txOut.CoinType
 	entry.packedFlags = packedFlags
 	entry.ticketMinOuts = ticketMinOuts
 
@@ -123,7 +125,10 @@ func (view *UtxoViewpoint) AddTxOut(tx *dcrutil.Tx, txOutIdx uint32,
 	}
 
 	// Set encoded flags for the transaction.
-	isCoinBase := standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled)
+	// SKA emissions and SSFee transactions have null inputs like coinbase but are NOT coinbase.
+	isCoinBase := standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled) &&
+		!wire.IsSKAEmissionTransaction(msgTx) &&
+		stake.DetermineTxType(msgTx) != stake.TxTypeSSFee
 	hasExpiry := msgTx.Expiry != wire.NoExpiryValue
 	txType := stake.DetermineTxType(msgTx)
 	tree := wire.TxTreeRegular
@@ -158,7 +163,10 @@ func (view *UtxoViewpoint) AddTxOuts(tx *dcrutil.Tx, blockHeight int64,
 
 	// Set encoded flags for the transaction.
 	msgTx := tx.MsgTx()
-	isCoinBase := standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled)
+	// SKA emissions and SSFee transactions have null inputs like coinbase but are NOT coinbase.
+	isCoinBase := standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled) &&
+		!wire.IsSKAEmissionTransaction(msgTx) &&
+		stake.DetermineTxType(msgTx) != stake.TxTypeSSFee
 	hasExpiry := msgTx.Expiry != wire.NoExpiryValue
 	txType := stake.DetermineTxType(msgTx)
 	tree := wire.TxTreeRegular
@@ -227,6 +235,7 @@ func utxoEntryToSpentTxOut(entry *UtxoEntry) spentTxOut {
 		blockHeight:   uint32(entry.BlockHeight()),
 		blockIndex:    entry.BlockIndex(),
 		scriptVersion: entry.ScriptVersion(),
+		coinType:      entry.CoinType(),
 		packedFlags: encodeFlags(entry.IsCoinBase(), entry.HasExpiry(),
 			entry.TransactionType()),
 	}
@@ -258,6 +267,20 @@ func (view *UtxoViewpoint) connectStakeTransaction(tx *dcrutil.Tx,
 		// Add the transaction's outputs as available utxos.
 		view.AddTxOuts(tx, blockHeight, blockIndex, isTreasuryEnabled)
 		return nil
+	}
+
+	// For SSFee, only skip null-input SSFee (creates new UTXO from scratch).
+	// Augmented SSFee (real input) spends a previous SSFee output and must be processed.
+	isSSFee := stake.DetermineTxType(msgTx) == stake.TxTypeSSFee
+	if isSSFee {
+		isNullInput := len(msgTx.TxIn) > 0 &&
+			msgTx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex
+		if isNullInput {
+			// Null-input SSFee - just add outputs, no inputs to spend
+			view.AddTxOuts(tx, blockHeight, blockIndex, isTreasuryEnabled)
+			return nil
+		}
+		// Augmented SSFee - fall through to spend its input normally
 	}
 
 	// Spend the referenced utxos by marking them spent in the view and, if a
@@ -332,6 +355,17 @@ func (view *UtxoViewpoint) connectRegularTransaction(tx *dcrutil.Tx,
 	// Coinbase transactions don't have any inputs to spend.
 	msgTx := tx.MsgTx()
 	if standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled) {
+		// Add the transaction's outputs as available utxos.
+		view.AddTxOuts(tx, blockHeight, blockIndex, isTreasuryEnabled)
+
+		// Keep track of in-flight transactions in order detect spends of
+		// earlier outputs by transactions later in the same block.
+		inFlightTx[*tx.Hash()] = blockIndex
+		return nil
+	}
+
+	// SKA emission transactions don't have any inputs to spend (similar to coinbase).
+	if wire.IsSKAEmissionTransaction(msgTx) {
 		// Add the transaction's outputs as available utxos.
 		view.AddTxOuts(tx, blockHeight, blockIndex, isTreasuryEnabled)
 
@@ -480,6 +514,7 @@ func (view *UtxoViewpoint) disconnectTransactions(block *dcrutil.Block,
 					blockHeight:   uint32(block.Height()),
 					blockIndex:    uint32(txIdx),
 					scriptVersion: txOut.Version,
+					coinType:      txOut.CoinType,
 					state:         utxoStateModified,
 					packedFlags: encodeUtxoFlags(isCoinBase, hasExpiry,
 						txType),
@@ -523,12 +558,16 @@ func (view *UtxoViewpoint) disconnectTransactions(block *dcrutil.Block,
 		}
 
 		// Loop backwards through all of the transaction inputs (except for the
-		// coinbase, treasurybase, and treasury spends which have no inputs) and
-		// unspend the referenced txos.  This is necessary to match the order of
-		// the spent txout entries.
-		if isCoinBase || isTreasuryBase || isTreasurySpend {
+		// coinbase, treasurybase, treasury spends, and null-input SSFee which have no inputs)
+		// and unspend the referenced txos.  This is necessary to match the order
+		// of the spent txout entries.
+		isSSFee := txType == stake.TxTypeSSFee
+		isNullInputSSFee := isSSFee && len(msgTx.TxIn) > 0 &&
+			msgTx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex
+		if isCoinBase || isTreasuryBase || isTreasurySpend || isNullInputSSFee {
 			continue
 		}
+		// Augmented SSFee (real input) continues to unspend its inputs
 		for txInIdx := len(msgTx.TxIn) - 1; txInIdx > -1; txInIdx-- {
 			// Ignore stakebase since it has no input.
 			if isVote && txInIdx == 0 {
@@ -553,6 +592,7 @@ func (view *UtxoViewpoint) disconnectTransactions(block *dcrutil.Block,
 					blockHeight:   stxo.blockHeight,
 					blockIndex:    stxo.blockIndex,
 					scriptVersion: stxo.scriptVersion,
+					coinType:      stxo.coinType,
 					state:         utxoStateModified,
 					packedFlags: encodeUtxoFlags(stxo.IsCoinBase(),
 						stxo.HasExpiry(), stxo.TransactionType()),
@@ -763,6 +803,43 @@ func (view *UtxoViewpoint) Entries() map[wire.OutPoint]*UtxoEntry {
 	return view.entries
 }
 
+// LookupEntriesByCoinType returns a map of all utxo entries in the view that
+// match the specified coin type. This is useful for dual-coin validation and
+// balance calculations.
+func (view *UtxoViewpoint) LookupEntriesByCoinType(coinType cointype.CoinType) map[wire.OutPoint]*UtxoEntry {
+	filteredMap := make(map[wire.OutPoint]*UtxoEntry)
+	for outpoint, entry := range view.entries {
+		if entry != nil && !entry.IsSpent() && entry.CoinType() == coinType {
+			filteredMap[outpoint] = entry
+		}
+	}
+	return filteredMap
+}
+
+// GetCoinTypeBalance calculates the total balance for all unspent outputs
+// of the specified coin type in the view.
+func (view *UtxoViewpoint) GetCoinTypeBalance(coinType cointype.CoinType) int64 {
+	var balance int64
+	for _, entry := range view.entries {
+		if entry != nil && !entry.IsSpent() && entry.CoinType() == coinType {
+			balance += entry.Amount()
+		}
+	}
+	return balance
+}
+
+// GetCoinTypeCount returns the number of unspent outputs of the specified
+// coin type in the view.
+func (view *UtxoViewpoint) GetCoinTypeCount(coinType cointype.CoinType) int {
+	var count int
+	for _, entry := range view.entries {
+		if entry != nil && !entry.IsSpent() && entry.CoinType() == coinType {
+			count++
+		}
+	}
+	return count
+}
+
 // ViewFilteredSet represents a set of utxos to fetch from the cache/backend
 // that are not already in a view.
 type ViewFilteredSet map[wire.OutPoint]struct{}
@@ -892,6 +969,27 @@ func (view *UtxoViewpoint) fetchInputUtxos(block *dcrutil.Block,
 			continue
 		}
 
+		// Handle SSFee transactions:
+		// - SSFee with null input (creating new UTXO): skip (like treasurybase)
+		// - SSFee with real input (augmenting existing UTXO): fetch the UTXO
+		isSSFee := stake.IsSSFee(msgTx)
+		if isSSFee {
+			// Augmented SSFee transactions have exactly one input with a real outpoint.
+			// Non-augmented SSFee have one input with a null outpoint (hash = all zeros).
+			// The null outpoint check: both hash bytes == 0 AND index == MaxPrevOutIndex
+			if len(msgTx.TxIn) > 0 {
+				outpoint := &msgTx.TxIn[0].PreviousOutPoint
+				// Check if this is NOT a null outpoint
+				// Null outpoint has Index == MaxPrevOutIndex (0xffffffff)
+				if outpoint.Index != wire.MaxPrevOutIndex {
+					// This is an augmented SSFee with a real input - fetch the UTXO
+					filteredSet.add(view, outpoint)
+				}
+			}
+			// Skip to next transaction (SSFee never has more than one input)
+			continue
+		}
+
 		isVote := stake.IsSSGen(msgTx)
 		for txInIdx, txIn := range msgTx.TxIn {
 			// Ignore stakebase since it has no input.
@@ -1009,12 +1107,14 @@ func (b *BlockChain) FetchUtxoView(tx *dcrutil.Tx, includeRegularTxns bool) (*Ut
 		outpoint.Index = uint32(txOutIdx)
 		filteredSet.add(view, &outpoint)
 	}
-	// Ignore coinbases, treasurybases, and treasury spends since none of them
-	// have any inputs.
+	// Ignore coinbases, treasurybases, treasury spends, SSFee, and SKA emission
+	// transactions since none of them have real inputs (they have null inputs).
 	isCoinBase := standalone.IsCoinBaseTx(msgTx, isTreasuryEnabled)
 	isTreasuryBase := txType == stake.TxTypeTreasuryBase
 	isTreasurySpend := txType == stake.TxTypeTSpend
-	if !isCoinBase && !isTreasuryBase && !isTreasurySpend {
+	isSSFee := txType == stake.TxTypeSSFee
+	isSKAEmission := wire.IsSKAEmissionTransaction(msgTx)
+	if !isCoinBase && !isTreasuryBase && !isTreasurySpend && !isSSFee && !isSKAEmission {
 		isVote := txType == stake.TxTypeSSGen
 		for txInIdx, txIn := range msgTx.TxIn {
 			// Ignore stakebase since it has no input.

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/cointype"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -75,8 +76,9 @@ func RegNetParams() *Params {
 				ValueIn:         wire.NullValueIn,
 			}},
 			TxOut: []*wire.TxOut{{
-				Version: 0x0000,
-				Value:   0x00000000,
+				Value:    0x00000000,
+				CoinType: cointype.CoinTypeVAR,
+				Version:  0x0000,
 				PkScript: hexDecode("801679e98561ada96caec2949a5d41c4cab3851e" +
 					"b740d951c10ecbcf265c1fd9"),
 			}},
@@ -121,10 +123,10 @@ func RegNetParams() *Params {
 		DivSubsidy:               101,
 		SubsidyReductionInterval: 128,
 		WorkRewardProportion:     6,
-		WorkRewardProportionV2:   1,
+		WorkRewardProportionV2:   5,
 		StakeRewardProportion:    3,
-		StakeRewardProportionV2:  8,
-		BlockTaxProportion:       1,
+		StakeRewardProportionV2:  5,
+		BlockTaxProportion:       0,
 
 		// AssumeValid is the hash of a block that has been externally verified
 		// to be valid.  It is also used to determine the old forks rejection
@@ -562,10 +564,10 @@ func RegNetParams() *Params {
 		//   Rk8KEdGMGJiF27CZ8rw2gDPD7MkVGSPjHinXjtTZhoH8ZQ6UhJvhV
 		//   Rk8JV484ePPX6vWZCfBX2Scme5XriXhzwmyaKSYQT64HTbkkfyzL3
 		//
-		// Organization address is RcQR65gasxuzf7mUeBXeAux6Z37joPuUwUN
-		OrganizationPkScript:        hexDecode("a9146913bcc838bd0087fb3f6b3c868423d5e300078d87"),
+		// Monetarium has no treasury (BlockTaxProportion = 0)
+		OrganizationPkScript:        nil,
 		OrganizationPkScriptVersion: 0,
-		BlockOneLedger:              tokenPayouts_RegNetParams(),
+		BlockOneLedger:              nil, // Monetarium has no premine
 
 		// Commands to generate regnet Pi keys:
 		// $ treasurykey.go -regnet
